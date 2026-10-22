@@ -7,6 +7,8 @@ $node = 'C:\Program Files\nodejs\node.exe'
 $logDir = 'D:\deepseenhanress\qq-bot\logs'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 $logFile = Join-Path $logDir 'backup.log'
+# 子进程（node）输出是 UTF-8，控制台默认按 GBK 解会把中文变成乱码
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 function W($m) {
   $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m
   Add-Content -Path $logFile -Value $line -Encoding UTF8
