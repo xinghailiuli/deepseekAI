@@ -1,0 +1,68 @@
+# MCP 注册片段（贴进 DSH 的 cordis.patch.yml）
+
+位置：`C:\Users\<你>\.dsh\profiles\desktop\cordis.patch.yml`
+
+**改之前先备份**：`copy cordis.patch.yml cordis.patch.yml.bak`
+DSH 重启会重写这个文件，你手工加的东西可能被抹掉 —— 重启后 `diff` 一遍。
+
+下面只列结构，路径换成你自己的。每个 MCP 都是 **stdio**：`command: node`，`args: [入口文件]`。
+
+```yaml
+# ── QQ 本体 ──────────────────────────────────────────
+mcp-servers:
+  snowluma:
+    command: node
+    args: ["D:/deploy/qq-bot/qq-bridge/src/mcp-snowluma-safe.js"]
+    env:
+      QQ_BRIDGE_URL: "http://127.0.0.1:3100"
+  snowluma-host:
+    command: node
+    args: ["D:/deploy/qq-bot/qq-bridge/src/mcp-snowluma-host.js"]
+
+# ── 平台只读 + 受控写 ────────────────────────────────
+  bili:
+    command: node
+    args: ["D:/deploy/qq-bot/features/B站/bili-mcp.mjs"]
+  heybox:
+    command: node
+    args: ["D:/deploy/qq-bot/features/小黑盒/heybox-mcp.mjs"]
+  github:
+    command: node
+    args: ["D:/deploy/qq-bot/features/GitHub/github-mcp.mjs"]
+  web-search-safe:
+    command: node
+    args: ["D:/deploy/qq-bot/features/搜索/web-search-mcp.mjs"]
+
+# ── 本地能力 ────────────────────────────────────────
+  diary:
+    command: node
+    args: ["D:/deploy/qq-bot/features/日记/diary-mcp.mjs"]
+  music:
+    command: node
+    args: ["D:/deploy/qq-bot/features/音乐/music-mcp.mjs"]
+  minecraft:
+    command: node
+    args: ["D:/deploy/qq-bot/features/玩游戏/mc-mcp.mjs"]
+  pcgame:
+    command: node
+    args: ["D:/deploy/qq-bot/features/电脑游戏/pcgame-mcp.mjs"]
+  xiaoxiaole:
+    command: node
+    args: ["D:/deploy/qq-bot/features/小游戏/game-mcp.mjs"]
+```
+
+## 三个必须注意的点
+
+1. **Windows 路径用正斜杠或双反斜杠**，单反斜杠在 YAML 里是转义字符，会解析失败。
+2. **改已有条目的 `args` 会热重载该服务**；改完 DSH 会重启这个 node 进程，别的服务不受影响。
+3. **工具白名单在 DSH 进程内存里**（`qq-tool-restrict.mjs`）。往白名单里加前缀之后必须
+   **重启 DSH**，否则 QQ 里调用会报「工具不在白名单内」。
+
+## 验证清单
+
+```powershell
+# 每个 MCP 能否单独跑起来（会等 stdin，Ctrl+C 退出）
+node D:\deploy\qq-bot\features\电脑游戏\pcgame-mcp.mjs
+# 在 DSH 里看工具是否出现
+#   → 会话里调一次该命名空间的任意工具，能返回结果即通
+```

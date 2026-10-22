@@ -1,0 +1,76 @@
+{
+  "consolePort": 3100,
+  "consoleToken": "",
+  "ownerQQ": 0,
+  "sessionCwd": "D:\\deepseenhanress",
+  "sendDelayMs": 800,
+
+  "allow": {
+    "private": [0],
+    "groups": [0]
+  },
+  "allowAllWhenEmpty": false,
+
+  "snowluma": {
+    "baseUrl": "http://127.0.0.1:13000",
+    "accessToken": "",
+    "selfId": 0
+  },
+
+  "dsh": {
+    "baseUrl": "http://127.0.0.1:19387",
+    "provider": "deepseek-official",
+    "model": "deepseek-flash",
+    "reasoningEffort": "high",
+    "authToken": "",
+    "authHeader": "authorization",
+    "authPrefix": "Bearer",
+    "allowRemote": false
+  },
+
+  "role": "roles/鲸鱼娘.md",
+
+  "socialV2": {
+    "enabled": true,
+    "agentPreset": "qq-chat-v2",
+    "autoReplyCheckMs": 30000,
+    "wake": {
+      "defaultMode": "diving",
+      "preSleepWaitEnabled": true,
+      "preSleepWaitMs": 300000,
+      "recommendedDefaultInfinite": true,
+      "recommendedProbability": 0.05,
+      "maxWakePerMinute": 0,
+      "maxWakePerHour": 0
+    },
+    "send": {
+      "burstEnabled": true,
+      "burstMaxMessages": 8,
+      "burstIntervalMinMs": 1000,
+      "burstIntervalMaxMs": 3000,
+      "maxSendPerMinute": 0,
+      "maxSendPerHour": 0,
+      "maxMessageChars": 500
+    },
+    "sticker": {
+      "enabled": true,
+      "collect": { "enabled": true, "maxPerMinute": 0, "maxPerHour": 0 }
+    },
+    "voice": {
+      "enabled": true,
+      "dir": "audio",
+      "maxSeconds": 300,
+      "ttsVoice": "zh-CN-XiaoyiNeural"
+    },
+    "proactive": {
+      "enabled": true,
+      "checkIntervalMinMs": 720000,
+      "checkIntervalMaxMs": 2100000,
+      "idleThresholdMs": 480000,
+      "probability": 0.75
+    },
+    "context": { "recentLimit": 100, "unreadLimit": 30, "contextWindow": 30 },
+    "initialPromptMaxChars": 2000,
+    "daily": []
+  }
+}
