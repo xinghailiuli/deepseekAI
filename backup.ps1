@@ -88,7 +88,7 @@ console.log("聊天记录已更新");
 import fs from "node:fs";
 const src = "D:/deepseenhanress/qq-bot/qq-bridge/config.json";
 const dst = "D:/deepseenhanress/鲸鱼档案/代码快照/config.redacted.json";
-const cfg = JSON.parse(fs.readFileSync(src, "utf8"));
+const cfg = JSON.parse(fs.readFileSync(src, "utf8").replace(/^\uFEFF/, ""));
 const SECRET = /token|secret|password|apiKey|accessToken|cookie/i;
 const walk = (o, path) => {
   if (Array.isArray(o)) return o.map((v, i) => walk(v, `${path}[${i}]`));
