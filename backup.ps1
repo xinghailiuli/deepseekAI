@@ -62,6 +62,52 @@ console.log("聊天记录已更新");
   W (& $node $tmp2 $today)
   Remove-Item $tmp2 -Force -ErrorAction SilentlyContinue
 
+  # 3.5) 代码快照：每次更新都要能回滚（只收代码与配置，token 一律脱敏）
+  $snap = Join-Path $root '代码快照'
+  if (-not (Test-Path $snap)) { New-Item -ItemType Directory -Path $snap -Force | Out-Null }
+  $copies = @(
+    @{ from = 'D:\deepseenhanress\qq-bot\qq-bridge\src\bridge.js';                              to = '代码快照\bridge.js' },
+    @{ from = 'D:\deepseenhanress\qq-bot\qq-bridge\dsh\agent-presets\qq-chat-v2\agent.cordis.yml'; to = '代码快照\agent.cordis.yml' },
+    @{ from = 'D:\deepseenhanress\qq-bot\qq-bridge\plugins\qq-agent-presets\qq-tool-restrict.mjs'; to = '代码快照\qq-tool-restrict.mjs' },
+    @{ from = 'D:\deepseenhanress\qq-bot\scripts\daily-diary.ps1';                              to = '代码快照\daily-diary.ps1' },
+    @{ from = 'D:\deepseenhanress\qq-bot\scripts\restart-dsh.ps1';                              to = '代码快照\restart-dsh.ps1' },
+    @{ from = 'D:\deepseenhanress\qq-bot\scripts\connect-phone-adb.ps1';                        to = '代码快照\connect-phone-adb.ps1' },
+    @{ from = 'D:\deepseenhanress\qq-bot\features\日记\diary-mcp.mjs';                          to = '代码快照\diary-mcp.mjs' },
+    @{ from = 'D:\deepseenhanress\qq-bot\features\手机\android-mcp.mjs';                        to = '代码快照\android-mcp.mjs' },
+    @{ from = 'D:\deepseenhanress\qq-bot\features\小黑盒\heybox-mcp.mjs';                       to = '代码快照\heybox-mcp.mjs' }
+  )
+  $copied = 0
+  foreach ($c in $copies) {
+    if (Test-Path $c.from) {
+      Copy-Item $c.from (Join-Path $root $c.to) -Force
+      $copied++
+    }
+  }
+  # 配置脱敏快照：token 一律替换成 ***，其余原样
+  $cfgPy = @'
+import fs from "node:fs";
+const src = "D:/deepseenhanress/qq-bot/qq-bridge/config.json";
+const dst = "D:/deepseenhanress/鲸鱼档案/代码快照/config.redacted.json";
+const cfg = JSON.parse(fs.readFileSync(src, "utf8"));
+const SECRET = /token|secret|password|apiKey|accessToken|cookie/i;
+const walk = (o, path) => {
+  if (Array.isArray(o)) return o.map((v, i) => walk(v, `${path}[${i}]`));
+  if (o && typeof o === "object") {
+    const out = {};
+    for (const [k, v] of Object.entries(o)) out[k] = SECRET.test(k) && typeof v === "string" && v ? "***" : walk(v, `${path}.${k}`);
+    return out;
+  }
+  return o;
+};
+fs.writeFileSync(dst, JSON.stringify(walk(cfg, ""), null, 2), "utf8");
+console.log("配置脱敏快照已更新");
+'@
+  $tmp3 = Join-Path $root 'tmp-redact.mjs'
+  [IO.File]::WriteAllText($tmp3, $cfgPy, (New-Object Text.UTF8Encoding($false)))
+  W (& $node $tmp3)
+  Remove-Item $tmp3 -Force -ErrorAction SilentlyContinue
+  W "代码快照已更新：$copied 个文件"
+
   # 4) 提交（git add -A 同时覆盖 deploy 文档的新改动）
   Set-Location $root
   $status = git status --porcelain
