@@ -22,6 +22,12 @@
 //    `tools.guard` 只能拒绝**执行**，工具名仍会出现在模型的 schema 里——
 //    那既不满足"仿真会话不得拥有本地执行能力"的注册期要求，也会诱导模型去调它。
 //    所以本地工具必须同时出现在下面的 restrict 名单里。
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { OWNER_TOOLS, isOwnerAgent, nativeModeEnabled, isGameTurn, GAME_READ_TOOLS } from './numen-owner-policy.mjs'
+import { apply as applyOwnerTools } from './qq-numen-owner-tools.mjs'
+
 export const name = 'qq-tool-restrict'
 
 export const inject = ['tools']
@@ -183,9 +189,32 @@ const SAFE_PREFIXES = [
 const SAFE_EXACT = new Set([
   'ask_user_question',
   'todo_write',
+  // Numen 只读工具（qq-numen-tools 注册）：状态与历史动作，不含动作执行
+  'mc_status',
+  'mc_last_actions',
+  // Numen 外接大脑：第一阶段只放只读的同伴列表，动作类工具一律不放。
+  'mcp__numen__list_companions',
 ])
 
+// 「分流已启用」标志：该文件存在时，旧 Minecraft MCP（假玩家）工具一律拒绝执行。
+// 目的：分类器判 chat 或异常时，琉璃不得绕过 Numen 直接用旧工具操作游戏。
+// 开关文件化，避免每次改配置都要动代码；无该文件时行为与改动前完全一致。
+const ROUTING_BLOCK_FLAG = path.join(os.homedir(), '.dsh', 'plugins', 'qq-agent-presets', 'numen-routing-block-mc.flag')
+
+const GUARD_STATUS_FILE = path.join(path.dirname(ROUTING_BLOCK_FLAG), 'numen-routing-guard-status.json')
+
+function routingBlockActive() {
+  try { return fs.existsSync(ROUTING_BLOCK_FLAG) } catch { return false }
+}
+
+function nameIsMcBlocked(name) {
+  return typeof name === 'string' && name.startsWith('mcp__minecraft__') && (routingBlockActive() || nativeModeEnabled())
+}
+
 export function apply(ctx) {
+  // Existing conversations retain their preset revision. Mount through this
+  // existing fiber so a scoped module reload also updates those conversations.
+  applyOwnerTools(ctx)
   // 1) 把已知危险全局工具从 schema 隐藏（restrict 只影响继承的全局层，
   //    不会误删 preset 自己注册的 scoped 工具）。
   // 逐个 restrict：当前 DSH 版本不存在的工具名会单独抛错并跳过，
@@ -205,12 +234,80 @@ export function apply(ctx) {
     }
   }
 
+  // 旧 Minecraft MCP 既要拒绝执行，也要从清单隐藏，否则模型仍会选中旧名字，
+  // 而不是新注册的 mc_status / mc_last_actions。schemas() 无 scope 返回全局层；
+  // 只限制其中已注册的旧命名空间，不影响 preset 内的 Numen 只读工具。
+  if (routingBlockActive()) {
+    try {
+      for (const { name } of ctx.tools.schemas()) {
+        if (!name.startsWith('mcp__minecraft__')) continue
+        try { ctx.tools.restrict({ deny: [name] }) }
+        catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
+      }
+    } catch (error) {
+      // 清单投影失败时保留下面的执行期拒绝，不把旧工具放行。
+      console.error(`[qq-tool-restrict] legacy Minecraft schema restriction failed: ${error?.message ?? error}`)
+    }
+  }
+
+  // schemas() 的全局视图不包含全部祖先/preset 工具，注册时间也可能更晚。
+  // 按本 QQ preset 的作用域，在最终组装结果中隐藏旧工具；不改人格、消息或注册表。
+  // DSH 的 waterfall 先 await next()，再变换最终结果，覆盖下游提供的工具。
+  if (typeof ctx.on === 'function') {
+    ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+      const assembled = await next()
+      const tools = assembled.tools.filter((tool) =>
+        !((routingBlockActive() || nativeModeEnabled()) && tool.name.startsWith('mcp__minecraft__'))
+        && !(tool.name.startsWith('mcp__numen__') && tool.name !== 'mcp__numen__list_companions')
+        && (!isGameTurn(_context.agent) || GAME_READ_TOOLS.has(tool.name))
+        && (!OWNER_TOOLS.has(tool.name) || isOwnerAgent(_context.agent)))
+      return tools.length === assembled.tools.length ? assembled : { ...assembled, tools }
+    })
+  }
+
   // 2) 执行期白名单：任何不在允许范围内的工具调用都会被拒绝。
   ctx.tools.guard((exec) => {
     const name = exec?.name
     if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
+    if (isGameTurn(exec?.agent) && !GAME_READ_TOOLS.has(name)) return '游戏来源回合只允许只读工具及受限游戏回复，不能修改 QQ 人设/记忆或发送 QQ 消息'
+    if (OWNER_TOOLS.has(name)) return isOwnerAgent(exec?.agent) ? undefined : '仅主人当前私聊会话可执行 Numen 动作'
     if (SAFE_EXACT.has(name)) return
+    // 分流启用后，Minecraft 只能经 Numen 执行；旧 MCP 假玩家工具在执行期被阻断。
+    if (nameIsMcBlocked(name)) {
+      return `分流已启用：旧 Minecraft MCP 工具 "${name}" 已禁用，游戏操作必须经 Numen 执行`
+    }
     if (SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))) return
     return `工具 "${name}" 不在 QQ 桥接白名单内，已拒绝（仅允许 QQ MCP 工具与无害模型侧工具）`
   })
+
+  // 注册期把旧 Mineflayer MCP 从模型可见工具清单里隐藏（执行期 guard 是第二道防线）。
+  const MCP_HIDDEN_FROM_SCHEMA = [
+    'mcp__minecraft__mc_action', 'mcp__minecraft__mc_status', 'mcp__minecraft__mc_view',
+    'mcp__minecraft__mc_goto', 'mcp__minecraft__mc_say', 'mcp__minecraft__mc_follow',
+  ]
+  for (const n of MCP_HIDDEN_FROM_SCHEMA) {
+    if (routingBlockActive()) try { ctx.tools.restrict({ deny: [n] }) } catch {}
+  }
+
+  // 自检并把结果落盘：桥接据此判断「阻断是否真的生效」，而不是只看标志文件是否存在。
+  // 只调用纯判定函数 nameIsMcBlocked()，绝不调用 ctx.tools.guard()（那是注册 API）。
+  try {
+    const flagPresent = routingBlockActive()
+    const verdict = flagPresent
+      ? (nameIsMcBlocked('mcp__minecraft__mc_status') ? 'blocked' : 'NOT-BLOCKED')
+      : 'flag-absent'
+    fs.writeFileSync(GUARD_STATUS_FILE, JSON.stringify({
+      at: new Date().toISOString(),
+      flagPresent,
+      mcBlocked: flagPresent && verdict === 'blocked',
+      verdict,
+      pid: process.pid,
+    }), 'utf8')
+  } catch (error) {
+    try {
+      fs.writeFileSync(GUARD_STATUS_FILE, JSON.stringify({ at: new Date().toISOString(), flagPresent: null, mcBlocked: false, verdict: 'selftest-error', error: String(error?.message ?? error) }), 'utf8')
+    } catch {}
+  }
 }
+
+// Reapply this existing scoped plugin for native acceptance without replacing sessions.

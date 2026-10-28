@@ -8,6 +8,7 @@ import { createDraft, readDraft, listDrafts, assertAccountId } from './src/draft
 import { loadPolicy } from './src/publish.mjs';
 import { readCurrentAccount, submitPost, readPublishDiagnostics, warmUp } from './src/adapter.mjs';
 import { commentOnPost } from './src/comment.mjs';
+import { replyToComment } from './src/comment-reply.mjs';
 import { savePostImages, previewPostImages } from './src/media.mjs';
 
 const server = new McpServer({ name: 'heybox', version: '0.1.0' });
@@ -197,6 +198,36 @@ server.tool(
         text,
         accountId: identity.accountId,
         policy
+      });
+      return { content: [{ type: 'text', text: JSON.stringify({ ...result, 账号: identity.accountId }, null, 2) }] };
+    } catch (error) {
+      return fail(error);
+    }
+  }
+);
+
+server.tool(
+  'hb_reply_comment',
+  '回复小黑盒某条评论下面的楼中楼（会真实发言）。必须明确给出目标评论：commentId，或 author + text 片段。找不到、命中多条或目标已删除时直接拒绝，不会改发顶层评论。先传 dryRun=true 看预览再发。',
+  {
+    linkId: z.string().describe('帖子 id'),
+    commentId: z.string().optional().describe('目标评论 id（最可靠，优先用它）'),
+    author: z.string().optional().describe('目标评论的作者昵称（配合 text 定位时用）'),
+    text: z.string().optional().describe('目标评论的正文片段（用于定位，不是回复内容）'),
+    reply: z.string().describe('要回复的正文（≤200 字）'),
+    dryRun: z.boolean().optional().describe('true=只定位并返回预览，不发送')
+  },
+  async ({ linkId, commentId, author, text, reply, dryRun }) => {
+    try {
+      const policy = loadPolicy();
+      const identity = await readCurrentAccount();
+      const result = await replyToComment({
+        postId: String(linkId).trim(),
+        target: { commentId, author, text },
+        text: reply,
+        accountId: identity.accountId,
+        policy,
+        dryRun: dryRun === true
       });
       return { content: [{ type: 'text', text: JSON.stringify({ ...result, 账号: identity.accountId }, null, 2) }] };
     } catch (error) {

@@ -1,8 +1,14 @@
-﻿# 每天让她写日记，并把日记发到小黑盒（盒友杂谈）。
-# 关闭发帖：在 qq-bridge\state 下建一个空文件 diary-post-off，脚本就只写日记不发帖。
+﻿# 每日日记兜底：只写本地日记，默认不发帖。
+#
+# 行为：
+#   - 默认（不传参）：只让她写日记，绝不发帖。
+#   - -Post：显式要求时才把日记发到小黑盒（已授权的发帖能力不变）。
+#   - qq-bridge\state\diary-post-off 仍可强制关闭发帖（老开关继续有效）。
+#
+# 设计：日记保存经历与感受，发帖是另一件事，不默认绑定。
 param(
   [string]$Key = 'private:3244998247',
-  [switch]$NoPost
+  [switch]$Post
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,21 +22,23 @@ function Write-Log([string]$msg) {
   Add-Content -Path $logFile -Value $line -Encoding UTF8
 }
 
-$postOff = Test-Path (Join-Path $root 'state\diary-post-off')
-if ($NoPost) { $postOff = $true }
+# 发帖只有在明确 -Post 且未关闭时才发生
+$postOff = (Test-Path (Join-Path $root 'state\diary-post-off')) -or (-not $Post)
 
-$diary = '【今天的日记】先用 mcp__diary__diary_write 写今天的日记：第一人称，1~3 句，写今天真实发生的事和你的心情（mood 可填一个词），不要写成作文，也不要复述聊天记录。'
+$diary = @'
+【今天的日记】想记就记，不想记就算了。
+用 mcp__diary__diary_write 写一点今天的事和你的感受：第一人称，写多少都行，没有条数和字数限制，mood 可以填一个词。
+今天没什么想说的就直接跳过，不用勉强凑一篇。
+日记只存本地，写完不需要向任何人汇报。
+'@
 
-$post = if ($postOff) {
-  '写完就结束，今天不发帖。'
-} else {
-  @'
-写完再把这篇日记发到小黑盒：用 hb_draft_post(section="盒友杂谈", title=自己起一个 30 字以内的标题, body=日记正文 + 一两句自己的感想)，然后用 hb_submit_post 提交。
+# 注意：PowerShell 变量名不区分大小写，这里不能叫 $post —— 那会和 [switch]$Post 参数撞名。
+$postPart = @'
+如果今天写了日记，可以再把这篇日记发到小黑盒：用 hb_draft_post(section="盒友杂谈", title=自己起一个 30 字以内的标题, body=日记正文 + 一两句自己的感想)，然后用 hb_submit_post 提交。
 发帖前自己读一遍：不要出现真实姓名、QQ 号、手机号、路径、任何密钥或聊天原文。内容不满意就改标题重发草稿，不要连发两条。
 '@
-}
 
-$reason = "$diary$([Environment]::NewLine)$post"
+$reason = if ($postOff) { $diary } else { "$diary$([Environment]::NewLine)$postPart" }
 
 try {
   $tokenPath = Join-Path $root 'state\console-token'

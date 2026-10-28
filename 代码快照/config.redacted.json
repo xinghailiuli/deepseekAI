@@ -1,4 +1,15 @@
 {
+  "numenRouting": {
+    "enabled": false,
+    "preset": "qq-classifier",
+    "blockFlagPath": "C:\\Users\\Administrator\\.dsh\\plugins\\qq-agent-presets\\numen-routing-block-mc.flag",
+    "guardStatusPath": "C:\\Users\\Administrator\\.dsh\\plugins\\qq-agent-presets\\numen-routing-guard-status.json",
+    "workspacePath": "D:\\deepseenhanress\\qq-bot\\qq-bridge\\state\\classifier-ws",
+    "dryRun": true,
+    "intentEnabled": false,
+    "intentPreset": "qq-intent",
+    "expectedSaveId": "QA_QQtest"
+  },
   "dsh": {
     "baseUrl": "http://127.0.0.1:19387",
     "provider": "deepseek-official",
@@ -188,7 +199,7 @@
       "maxWakePerHour": 0,
       "noActionLimit": 3,
       "maxWakeConfigReminders": 2,
-      "proactiveProbability": 0.6
+      "proactiveProbability": 0
     },
     "send": {
       "burstEnabled": true,
@@ -243,7 +254,7 @@
       "ttsVoice": "zh-CN-XiaoyiNeural"
     },
     "proactive": {
-      "enabled": true,
+      "enabled": false,
       "checkIntervalMinMs": 720000,
       "checkIntervalMaxMs": 2100000,
       "idleThresholdMs": 480000,
@@ -252,7 +263,8 @@
     "feedback": {
       "maxLength": 500,
       "notifyOwnerOnError": false,
-      "hideNotices": true
+      "hideNotices": true,
+      "fatalNotify": true
     },
     "context": {
       "recentLimit": 60,
@@ -269,42 +281,7 @@
       "maxPixels": 64000000,
       "maxCount": 5
     },
-    "daily": [
-      {
-        "key": "group:976850526",
-        "window": [
-          "08:10",
-          "11:20"
-        ],
-        "topics": [
-          "天气",
-          "运势",
-          "星座"
-        ]
-      },
-      {
-        "key": "group:976850526",
-        "window": [
-          "20:10",
-          "23:20"
-        ],
-        "topics": [
-          "星座",
-          "天气"
-        ]
-      },
-      {
-        "key": "private:3244998247",
-        "window": [
-          "14:00",
-          "22:30"
-        ],
-        "reason": "play",
-        "topics": [
-          "去 Minecraft 里逛逛"
-        ]
-      }
-    ]
+    "daily": []
   },
   "webSearch": {
     "provider": "auto",
@@ -316,5 +293,14 @@
     "maxTokens": 4096,
     "maxResults": 8,
     "timeoutMs": 35000
+  },
+  "numenNative": {
+    "enabled": true,
+    "allowMovement": false,
+    "allowGameEvents": false,
+    "allowGameReply": true,
+    "allowTrustedGameEvents": true,
+    "allowBasicActions": true,
+    "basicMode": "daily"
   }
 }
