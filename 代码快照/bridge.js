@@ -9914,6 +9914,10 @@ function formatMemoryV2(st) {
       }
     } catch (e) { log('[action] 回合建立失败 ' + (e?.message ?? e)); }
     promptText = await __augmentOwnerPrompt(key, promptText, nativeService.enabled);
+    // Native observation records are context on a genuine request, never a new
+    // owner identity, action authorization, separate model, or broadcast.
+    const nativeEnvironmentOffer=key===`private:${cfg.ownerQQ}`?nativeService.environmentContext?.():null;
+    if(nativeEnvironmentOffer?.text)promptText+='\n\n'+nativeEnvironmentOffer.text;
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
     if (Array.isArray(opts.media) && opts.media.length > 0) {
       const imageParts = await resolveMediaList(opts.media);
@@ -9940,6 +9944,7 @@ function formatMemoryV2(st) {
       return { ok: false, error: safeErrText };
     }
     if (nativeRequestId) nativeService.acceptPrompt(nativeRequestId, accepted.rpcId);
+    if(nativeRequestId&&nativeEnvironmentOffer?.eventIds?.length)nativeService.environmentContextAccepted(nativeEnvironmentOffer.eventIds,nativeRequestId);
     if (wakeSnapshot && isCurrentSession(key, sessionId)
         && socialV2.conversations.get(canonicalV2Key(key)) === wakeState
         && wakeState.agentToken === wakeToken) {

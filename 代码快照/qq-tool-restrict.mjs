@@ -164,6 +164,10 @@ const KNOWN_DANGEROUS_GLOBAL_TOOLS = [
 // 供 test-preset-local-tools.mjs 导入并与 DSH 真实工具名对账，避免两份名单漂移。
 export const RESTRICTED_TOOL_NAMES = Object.freeze([...KNOWN_DANGEROUS_GLOBAL_TOOLS])
 
+// 组装期的黑名单兜底集合：restrict() 对「当时还没注册」的名字会抛错并被吞掉，
+// 于是晚注册的工具会漏出可见面。这里用同一份名单再兜一次（只减可见面，不改执行权限）。
+const RESTRICTED_SET = new Set(RESTRICTED_TOOL_NAMES)
+
 // 执行期白名单：不在这些范围内的工具一律拒绝。
 // 前缀覆盖 DSH MCP client 暴露的命名空间工具。
 const SAFE_PREFIXES = [
@@ -260,7 +264,8 @@ export function apply(ctx) {
         !((routingBlockActive() || nativeModeEnabled()) && tool.name.startsWith('mcp__minecraft__'))
         && !(tool.name.startsWith('mcp__numen__') && tool.name !== 'mcp__numen__list_companions')
         && (!isGameTurn(_context.agent) || GAME_READ_TOOLS.has(tool.name))
-        && (!OWNER_TOOLS.has(tool.name) || isOwnerAgent(_context.agent)))
+        && (!OWNER_TOOLS.has(tool.name) || isOwnerAgent(_context.agent))
+        && !RESTRICTED_SET.has(tool.name))
       return tools.length === assembled.tools.length ? assembled : { ...assembled, tools }
     })
   }

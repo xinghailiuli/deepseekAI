@@ -301,6 +301,8 @@
     "allowGameReply": true,
     "allowTrustedGameEvents": true,
     "allowBasicActions": true,
-    "basicMode": "daily"
+    "basicMode": "daily",
+    "allowProactiveAlerts": true,
+    "allowSafeInteractions": true
   }
 }
