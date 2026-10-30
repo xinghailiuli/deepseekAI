@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createNumenRouter } from './numen-router.js';
@@ -1388,13 +1389,23 @@ const appendBridgeLog = createCappedLogger(BRIDGE_LOG, 2000);
 const processJournal = createProcessJournal({file:path.join(STATE_DIR,'process-lifecycle.jsonl'),processRef:process,sanitize:redactSensitiveText});
 let closeNativeBeforeExit=async()=>{};
 
+let logRepeatBody = null, logRepeatCount = 0, logRepeatEmitAt = 0;
+// 同一条日志连续重复时不再逐条输出：每 30 秒最多一条摘要，避免服务不可用期间刷屏。
+const LOG_REPEAT_WINDOW_MS = 30_000;
 function log(...args) {
   let line;
   try {
-    const body = args
+    let body = args
       .map((a) => redactSensitiveText(typeof a === 'string' ? a : JSON.stringify(a)))
       .join(' ')
       .replace(/[\r\n]+/g, ' ');
+    if (body === logRepeatBody) {
+      logRepeatCount += 1;
+      if (Date.now() - logRepeatEmitAt < LOG_REPEAT_WINDOW_MS) return;
+      body = `${body}（同类日志重复 ${logRepeatCount} 次，已折叠）`;
+      logRepeatCount = 0;
+    } else { logRepeatBody = body; logRepeatCount = 0; }
+    logRepeatEmitAt = Date.now();
     line = `${localClock()} [bridge] ${body.length > LOG_LINE_MAX ? `${body.slice(0, LOG_LINE_MAX)}…[截断]` : body}`;
   } catch {
     line = `${localClock()} [bridge] (日志参数无法序列化)`;
@@ -8621,14 +8632,47 @@ function sendToQQ(key, msg, {receipt=false}={}) {
     return delays;
   }
 
+  // 「现在是不是在打游戏」：不用端口探测（异步不可靠），改成维护一个标志位。
+  // 置位来源：配置了游戏端口探测的定时器（见下方 __startGameWatch），每 5 秒同步探一次。
+  let __gameLive = false;
+  function isGameSessionLive() { return __gameLive === true; }
+  let __gameWatchTimer = null;
+  function __startGameWatch() {
+    if (__gameWatchTimer) return;
+    const probe = () => {
+      const sock = net.connect({ host: '127.0.0.1', port: 39001 });
+      sock.setTimeout(500);
+      sock.on('connect', () => { __gameLive = true; sock.destroy(); });
+      sock.on('error', () => { __gameLive = false; });
+      sock.on('timeout', () => { __gameLive = false; sock.destroy(); });
+    };
+    __gameWatchTimer = setInterval(probe, 5000);
+    if (__gameWatchTimer.unref) __gameWatchTimer.unref();
+    probe();
+  }
+  try { __startGameWatch(); } catch { /* 探测失败不影响启动 */ }
+
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
-    // 拟人化：不是想完就发，先「拿起手机、打完字」停一下再发第一条；深夜更慢。
+    // 拟人化延迟：按「这条回复有多长」自适应。寒暄/短回应几乎立刻发出，
+    // 长段解释或回忆才多停几秒；深夜整体放慢，但短句仍然快。
     const firstCfg = (cfg.socialV2 && cfg.socialV2.send) || {};
-    const firstMin = Math.max(0, Number(firstCfg.firstDelayMinMs) || 1500);
-    const firstMax = Math.max(firstMin, Number(firstCfg.firstDelayMaxMs) || 4500);
-    const firstDelay = Math.round(randInt(firstMin, firstMax) * nightPaceFactor());
+    const firstText = String((messages && messages[0]) != null ? messages[0] : '');
+    const chars = [...firstText.replace(/\s/g, '')].length;
+    const shortSide = chars <= 4;
+    // 打游戏时（MC 原生桥在跑）要跟得上节奏，几乎不压延迟；其它场景保持拟人化。
+    // 不能用 cfg.numenNative.enabled 判断：那是常开配置开关，MC 关着时它也是 true。
+    // 真正的信号是 MC 原生 MCP 端口 39001 是否在监听——它在，说明游戏正开着。
+    const inGame = isGameSessionLive();
+    const baseMin = inGame ? 60 : (shortSide ? 200 : Math.min(2500, 400 + chars * 40));
+    const baseMax = inGame ? 220 : (shortSide ? 800 : Math.min(5000, 900 + chars * 70));
+    let firstDelay = Math.round(randInt(baseMin, Math.max(baseMin, baseMax)) * nightPaceFactor());
+    if (inGame) firstDelay = Math.min(firstDelay, 300);
+    else if (shortSide) firstDelay = Math.min(firstDelay, 1500);
+    const hardMax = Math.max(0, Number(firstCfg.firstDelayMaxMs) || 0);
+    if (hardMax > 0) firstDelay = Math.min(firstDelay, hardMax);
+    firstDelay = Math.max(0, firstDelay);
     if (firstDelay > 0) sendChain = sendChain.then(() => sleep(firstDelay));
     const sent = [];
     const failed = [];
@@ -11078,6 +11122,14 @@ function buildWakePromptV2(key, reason) {
     if (reason === 'daily') {
       const topics = dailyTopicsByKey.get(key) || '天气、今日运势、星座';
       return `${base}【每日日常】${key}\n原因：到你每天的日常时间了（${topics}）。\n先用 mcp__web-search-safe__web_search 查今天这些东西（关键词自己定，别问别人），然后用你自己的口气说一两句——像随手分享，不要播报腔、不要列点、不要写"今日运势：大吉"这种格式。\n一条为主，最多两条；没人接话就算了，别追问。`;
+    }
+    // 任务型唤醒：日记/备份这类「做完就好」的事，不能套社交判断的框架。
+    // 否则她会去判断氛围、看有没有人说话，然后得出「没人说话，收尾了」。
+    if (reason === 'dailyDiary') {
+      return `${base}【今天的日记】${key}\n这是一件你自己的事，不是社交场合：不用判断群里热闹还是冷清，不用看有没有人找你，也不用等任何人。\n现在只做一步：调用 mcp__diary__diary_write，写你今天真想记的一件事或一种感觉。第一人称，1~3 句，200 字以内，mood 填一个词。\n写完就结束，不需要发消息，不需要汇报，也不用回复任何人。`;
+    }
+    if (reason === 'dailyDiaryPost') {
+      return `${base}【今天的日记】${key}\n这是一件你自己的事，不是社交场合：不用判断群里热闹还是冷清，不用等任何人。\n第一步：调用 mcp__diary__diary_write 写今天的日记（第一人称，1~3 句，200 字以内，mood 填一个词）。\n第二步：把这篇日记发到小黑盒——用 hb_draft_post(section="盒友杂谈", title=自己起一个 30 字以内的标题, body=日记正文+一两句感想)，再用 hb_submit_post 提交。\n发帖前自己读一遍：不要出现真实姓名、QQ 号、手机号、路径、密钥或聊天原文；不满意就改标题重发草稿，不要连发两条。\n做完就结束，不需要汇报。`;
     }
     if (reason === 'play') {
       return `${base}【去玩会儿】${key}\n原因：到你自己玩的时间了。你有一台 Minecraft 服务器（本机），你的人物已经在里面了。\n先用 mc_status 看看自己在哪、身边有谁；没人就自己走走、看看风景，或者在游戏里自言自语一句。\n玩一会儿就回来，别待太久；想跟主人说一声就用 qq_send_message 发一句「我去游戏里了」之类。`;

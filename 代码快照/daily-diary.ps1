@@ -26,10 +26,11 @@ function Write-Log([string]$msg) {
 $postOff = (Test-Path (Join-Path $root 'state\diary-post-off')) -or (-not $Post)
 
 $diary = @'
-【今天的日记】想记就记，不想记就算了。
-用 mcp__diary__diary_write 写一点今天的事和你的感受：第一人称，写多少都行，没有条数和字数限制，mood 可以填一个词。
-今天没什么想说的就直接跳过，不用勉强凑一篇。
-日记只存本地，写完不需要向任何人汇报。
+【今天的日记】
+现在做一件事：调用 mcp__diary__diary_write，记下今天。
+写你此刻真想记的那件事或那种感觉，第一人称，1~3 句，200 字以内，mood 填一个词。
+写什么由你定，但这一步今天要做完——日记只有你自己写才算数。
+日记只存本地，写完不用跟任何人汇报。
 '@
 
 # 注意：PowerShell 变量名不区分大小写，这里不能叫 $post —— 那会和 [switch]$Post 参数撞名。
@@ -38,7 +39,9 @@ $postPart = @'
 发帖前自己读一遍：不要出现真实姓名、QQ 号、手机号、路径、任何密钥或聊天原文。内容不满意就改标题重发草稿，不要连发两条。
 '@
 
-$reason = if ($postOff) { $diary } else { "$diary$([Environment]::NewLine)$postPart" }
+# reason 用专用类型：桥接会走 dailyDiary 分支（任务型），不会被包成「判断要不要说话」的社交唤醒。
+# 需要发小黑盒时用 dailyDiaryPost，同样由桥接分支处理。
+$reason = if ($postOff) { 'dailyDiary' } else { 'dailyDiaryPost' }
 
 try {
   $tokenPath = Join-Path $root 'state\console-token'

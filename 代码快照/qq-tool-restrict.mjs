@@ -171,21 +171,11 @@ const RESTRICTED_SET = new Set(RESTRICTED_TOOL_NAMES)
 // 执行期白名单：不在这些范围内的工具一律拒绝。
 // 前缀覆盖 DSH MCP client 暴露的命名空间工具。
 const SAFE_PREFIXES = [
-  'mcp__snowluma__',
-  'mcp__snowluma-host__',
-  'mcp__web-search-safe__',
-  // 本机自建能力（只读/只追加，无系统操作权限）
-  'mcp__diary__',
-  'mcp__music__',
-  'mcp__voice__',   // 听语音：get_record + 本地 whisper 转写
-  'mcp__heybox__',  // 小黑盒：看帖/搜索/草稿/发布（独立命名空间）
-  'mcp__minecraft__', // MC：状态/游戏内说话/跟随/移动（本机服务器）
-  'mcp__bili__',      // B站：推荐流/视频详情/搜索/热评（只读）
-    'mcp__pcgame__',     // 电脑上的游戏：列窗口/截图/点击/启动（只能操作指定窗口）
-    'mcp__xiaoxiaole__', // 消消乐
-    'mcp__github__',     // GitHub：只读仓库/issue/PR
-  'mcp__android_', // 安卓手机（MCP 形式：mcp__android__screen 等）
-  'android_',      // 安卓手机（预设插件形式：android_devices 等）   // 安卓手机：截图/点击/滑动/输入/装应用/读日志（adb，USB 或无线）
+  'mcp__snowluma__',        // QQ：收发消息/表情/语音/记忆/唤醒配置
+  'mcp__heybox__',          // 小黑盒：看帖/搜索/草稿/发布/评论/存图
+  'mcp__web-search-safe__', // 联网搜索/抓取：只读，SSRF 防护在 MCP 内部
+  'mcp__github__',          // GitHub：只读仓库/issue/PR（2026-10-30 恢复）
+  'mcp__diary__',           // 日记：只追加，写进她自己的写作目录（2026-10-30 恢复）
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
@@ -193,12 +183,7 @@ const SAFE_PREFIXES = [
 const SAFE_EXACT = new Set([
   'ask_user_question',
   'todo_write',
-  // Numen 只读工具（qq-numen-tools 注册）：状态与历史动作，不含动作执行
-  'mc_status',
-  'mc_last_actions',
-  // Numen 外接大脑：第一阶段只放只读的同伴列表，动作类工具一律不放。
-  'mcp__numen__list_companions',
-])
+]);
 
 // 「分流已启用」标志：该文件存在时，旧 Minecraft MCP（假玩家）工具一律拒绝执行。
 // 目的：分类器判 chat 或异常时，琉璃不得绕过 Numen 直接用旧工具操作游戏。
