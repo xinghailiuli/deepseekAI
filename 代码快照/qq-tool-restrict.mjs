@@ -25,8 +25,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { OWNER_TOOLS, isOwnerAgent, nativeModeEnabled, isGameTurn, GAME_READ_TOOLS } from './numen-owner-policy.mjs'
-import { apply as applyOwnerTools } from './qq-numen-owner-tools.mjs'
+import { OWNER_TOOLS, isOwnerAgent, nativeModeEnabled, isGameTurn, GAME_READ_TOOLS } from './numen-owner-policy.program-20261029.mjs'
+import { apply as applyOwnerTools } from './qq-numen-owner-tools.program-20261029.mjs'
 
 export const name = 'qq-tool-restrict'
 

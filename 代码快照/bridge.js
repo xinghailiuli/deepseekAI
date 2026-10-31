@@ -191,6 +191,7 @@ import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, render
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
+import { createCompanionClient } from './companion-client.mjs';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
@@ -2798,6 +2799,9 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
     allowRemote: cfg.dsh.allowRemote === true
   });
   dshApiForClassifier = api;
+  const companion = createCompanionClient({ api, baseUrl: cfg.dsh.baseUrl, root: path.resolve(ROOT, '../state/liuli-companion'), eligibility: key => ({authorized:isSessionAllowedInCurrentMode(key),paused:socialV2.paused||currentMode!=='reserved2',disabled:cfg.socialV2?.enabled===false}), log });
+  const companionFlushTimer = setInterval(() => { void companion.flush(); }, 30000);
+  companionFlushTimer.unref?.();
   const yieldedIdleTurns = new Set();
   function recordGameScheduling(entry) {
     const file=path.join(STATE_DIR,'numen-native','scheduling-audit.jsonl');
@@ -5534,6 +5538,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
           for (const [key, st] of socialV2.conversations) {
             list.push({
               key,
+              eligible: isSessionAllowedInCurrentMode(key) && cfg.socialV2?.enabled !== false && !socialV2.paused,
               wakeConfig: st.wakeConfig,
               unreadCount: st.unread.length,
               recentCount: st.recentMessages.length,
@@ -5569,7 +5574,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
           // 永远拿不到引导 —— 而 bootstrapSent 一旦置真，后续再也不会补发。
           const firstWake = !st.bootstrapSent;
           if (firstWake) st.bootstrapSent = true;
-          const effectiveReason = firstWake ? 'bootstrap' : reason;
+          const effectiveReason = firstWake && reason !== 'manualProactive' ? 'bootstrap' : reason;
           saveSocialV2State();
           // 和其它唤醒入口保持一致：sendWakePromptV2 是异步的，这里不 await（不能让 HTTP 回复
           // 等一个可能卡几十秒的模型回合），但必须挂 catch。裸调用一旦 reject 就是
@@ -5995,7 +6000,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
               time: Date.now()
             });
             const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
-            if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+            if (!st.liuliRetainUnread && st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
             st.preSleepWaitSatisfiedAt = 0;
             st.preSleepWaitObservedAt = 0;
             st.preSleepWaitAccumMs = 0;
@@ -6417,7 +6422,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
               time: Date.now()
             });
             const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
-            if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+            if (!st.liuliRetainUnread && st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
             st.lastAiReplyAt = now;
             st.lastActionAt = now;
             st.wakeConfig.noActionCount = 0;
@@ -9231,6 +9236,7 @@ function sendToQQ(key, msg, {receipt=false}={}) {
             },
             recentMessages: Array.isArray(val.recentMessages) ? val.recentMessages : [],
             unread: Array.isArray(val.unread) ? val.unread : [],
+            liuliRetainUnread: val.liuliRetainUnread === true,
             lastWakeReason: String(val.lastWakeReason ?? ''),
             lastAiReplyAt: Number(val.lastAiReplyAt) || 0,
             lastActionAt: Number(val.lastActionAt) || 0,
@@ -9322,8 +9328,9 @@ function sendToQQ(key, msg, {receipt=false}={}) {
       for (const [key, st] of socialV2.conversations) {
         obj.conversations[key] = {
           wakeConfig: st.wakeConfig,
-          recentMessages: st.recentMessages.slice(-200),
-          unread: st.unread.slice(-100),
+          recentMessages: st.liuliRetainUnread ? st.recentMessages : st.recentMessages.slice(-200),
+          unread: st.liuliRetainUnread ? st.unread : st.unread.slice(-100),
+          liuliRetainUnread: st.liuliRetainUnread === true,
           lastWakeReason: st.lastWakeReason,
           lastAiReplyAt: st.lastAiReplyAt,
           lastActionAt: st.lastActionAt,
@@ -9903,6 +9910,10 @@ function formatMemoryV2(st) {
       return { ok: true, skipped: true };
     };
     if (wakeBlocked()) return skipWake();
+    if (opts.wakeReason) {
+      const gate = await companion.beforeWake({ scope: key, reason: opts.wakeReason });
+      if (!gate.allow) { log(`[liuli] 暂缓排队唤醒 ${key}: ${gate.reason}`); return skipWake(); }
+    }
     if (!dshReady) {
       const items = queued.get(key) ?? [];
       if (items.length >= QUEUE_MAX) {
@@ -9938,11 +9949,9 @@ function formatMemoryV2(st) {
         const historyBlock = await groupHistoryBlockV2(key, 15).catch(() => '');
         if (historyBlock) promptText += `\n\n${historyBlock}`;
       }
-      // 跨会话记忆：把别的窗口里记过的人和事带进来（帖子要求"按人存，换了地方还认识你"）
-      {
-        const memBlock = crossConversationMemoryBlockV2(key);
-        if (memBlock) { promptText += "`n`n" + memBlock; log(`[memory] 注入跨会话记忆 ${key}：${memBlock.split(String.fromCharCode(10)).length} 行`); }
-      }
+      // Companion recall preserves the current QQ scope, including after identity merges.
+      const companionContext = await companion.context({ scope: key, query: (wakeState.unread || []).slice(-5).map(m => m.plain || m.text || '').join('\n') });
+      if (companionContext.text) promptText += '\n\n' + companionContext.text;
       wakeSnapshot = buildWakeSnapshotV2(key);
       if (wakeSnapshot) {
         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
@@ -9988,6 +9997,7 @@ function formatMemoryV2(st) {
       return { ok: false, error: safeErrText };
     }
     if (nativeRequestId) nativeService.acceptPrompt(nativeRequestId, accepted.rpcId);
+    if (opts.wakeReason) void companion.delivered({ scope: key, reason: opts.wakeReason });
     if(nativeRequestId&&nativeEnvironmentOffer?.eventIds?.length)nativeService.environmentContextAccepted(nativeEnvironmentOffer.eventIds,nativeRequestId);
     if (wakeSnapshot && isCurrentSession(key, sessionId)
         && socialV2.conversations.get(canonicalV2Key(key)) === wakeState
@@ -10667,9 +10677,9 @@ function formatMemoryV2(st) {
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
     st.recentMessages.push(msg);
-    if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    if (!st.liuliRetainUnread && st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
-    if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    if (!st.liuliRetainUnread && st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -10716,9 +10726,9 @@ function formatMemoryV2(st) {
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
     st.recentMessages.push(msg);
-    if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    if (!st.liuliRetainUnread && st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
-    if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    if (!st.liuliRetainUnread && st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     saveSocialV2State();
     return msg;
   }
@@ -10741,7 +10751,7 @@ function formatMemoryV2(st) {
         time: now + i * 1000
       });
     }
-    if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    if (!st.liuliRetainUnread && st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     // AI 实际发言/参与了，说明这轮选择“继续回复”，沉睡前观察状态作废；下次想睡需重新走 5 分钟等待。
     st.preSleepWaitSatisfiedAt = 0;
     st.preSleepWaitObservedAt = 0;
@@ -10940,6 +10950,7 @@ function formatMemoryV2(st) {
       st.lastReadThroughSeq = Math.max(st.lastReadThroughSeq || 0, throughSeq);
     }
     noteModelMessagesV2(st, []);
+    if(st.unread.length===0)st.liuliRetainUnread=false;
     return before - st.unread.length;
   }
 
@@ -11104,7 +11115,7 @@ function buildWakePromptV2(key, reason) {
     // 操作者预写的「初始提示词」（圈子主题/群内氛围等）：**只在首次唤醒**注入。
     // 放在最前面几段（角色/令牌之后）而不是末尾，是为了让它在长 prompt 里足够显眼；
     // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
-    const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
+    const initialPromptText = reason === 'bootstrap' || reason === 'manualProactive' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + voiceLine + replyLine + multiPointLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
@@ -11116,7 +11127,7 @@ function buildWakePromptV2(key, reason) {
     if (reason === 'replyCheck') {
       return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，需要短静默就用 qq_wait_for_messages(purpose="reply") 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
-    if (reason === 'proactiveCheck') {
+    if (reason === 'proactiveCheck' || reason === 'manualProactive') {
       return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'daily') {
@@ -11126,10 +11137,10 @@ function buildWakePromptV2(key, reason) {
     // 任务型唤醒：日记/备份这类「做完就好」的事，不能套社交判断的框架。
     // 否则她会去判断氛围、看有没有人说话，然后得出「没人说话，收尾了」。
     if (reason === 'dailyDiary') {
-      return `${base}【今天的日记】${key}\n这是一件你自己的事，不是社交场合：不用判断群里热闹还是冷清，不用看有没有人找你，也不用等任何人。\n现在只做一步：调用 mcp__diary__diary_write，写你今天真想记的一件事或一种感觉。第一人称，1~3 句，200 字以内，mood 填一个词。\n写完就结束，不需要发消息，不需要汇报，也不用回复任何人。`;
+      return `${base}【今天的日记】${key}\n这是一件你自己的事，不是社交场合：不用判断群里热闹还是冷清，不用看有没有人找你，也不用等任何人。\n现在只做一步：调用 mcp__diary__diary_write，写你今天真想记的一件事或一种感觉。第一人称，篇幅和段落按真实内容自由展开，mood 填一个词。\n写完就结束，不需要发消息，不需要汇报，也不用回复任何人。`;
     }
     if (reason === 'dailyDiaryPost') {
-      return `${base}【今天的日记】${key}\n这是一件你自己的事，不是社交场合：不用判断群里热闹还是冷清，不用等任何人。\n第一步：调用 mcp__diary__diary_write 写今天的日记（第一人称，1~3 句，200 字以内，mood 填一个词）。\n第二步：把这篇日记发到小黑盒——用 hb_draft_post(section="盒友杂谈", title=自己起一个 30 字以内的标题, body=日记正文+一两句感想)，再用 hb_submit_post 提交。\n发帖前自己读一遍：不要出现真实姓名、QQ 号、手机号、路径、密钥或聊天原文；不满意就改标题重发草稿，不要连发两条。\n做完就结束，不需要汇报。`;
+      return `${base}【今天的日记】${key}\n这是一件你自己的事，不是社交场合：不用判断群里热闹还是冷清，不用等任何人。\n第一步：调用 mcp__diary__diary_write 写今天的日记（第一人称，篇幅和段落按真实内容自由展开，mood 填一个词）。\n第二步：把这篇日记发到小黑盒——用 hb_draft_post(section="盒友杂谈", title=自己起一个 30 字以内的标题, body=日记正文+一两句感想)，再用 hb_submit_post 提交。\n发帖前自己读一遍：不要出现真实姓名、QQ 号、手机号、路径、密钥或聊天原文；不满意就改标题重发草稿，不要连发两条。\n做完就结束，不需要汇报。`;
     }
     if (reason === 'play') {
       return `${base}【去玩会儿】${key}\n原因：到你自己玩的时间了。你有一台 Minecraft 服务器（本机），你的人物已经在里面了。\n先用 mc_status 看看自己在哪、身边有谁；没人就自己走走、看看风景，或者在游戏里自言自语一句。\n玩一会儿就回来，别待太久；想跟主人说一声就用 qq_send_message 发一句「我去游戏里了」之类。`;
@@ -11206,6 +11217,8 @@ async function sendWakePromptV2(key, reason) {
       log(`[reserved2] 跳过唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
     }
+    const companionGate = await companion.beforeWake({ scope: key, reason });
+    if (!companionGate.allow) { log(`[liuli] 暂缓唤醒 ${key}: ${companionGate.reason}`); return; }
     const st = getSocialV2State(key);
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
@@ -11412,7 +11425,7 @@ async function sendWakePromptV2(key, reason) {
   // 与「未读消息」无关的唤醒原因（定时器/引导）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
-  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin']);
+  const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'manualProactive', 'wakeAfterSleep']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
@@ -11848,7 +11861,14 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
     // 二代仿真模式（reserved2）：唤醒调度
     if (currentMode === 'reserved2') {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+      if(await companion.sleeping())getSocialV2State(key).liuliRetainUnread=true;
       appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
+      await companion.ingest({
+        scope: key, subject: String(event.user_id), id: String(event.message_id ?? event.msg_id ?? `local-${getSocialV2State(key).lastUnreadSeq}`),
+        text: String(plainContent || '').slice(0,30000), authorized: isSessionAllowedInCurrentMode(key), paused: socialV2.paused,
+        disabled: cfg.socialV2?.enabled === false, at: Date.now(), sessionId: state.sessions[key] || null,
+        adminWake: isOwner && /^(?:醒醒|起床|叫醒|琉璃醒醒)[！!。\s]*$/.test(String(plainContent || '').trim()),
+      });
       // 二代同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
       if (kind === 'group') feedSlangWindow(key, sender, plainContent);
       if (socialV2.paused) {
