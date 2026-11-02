@@ -192,6 +192,7 @@ import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport,
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { createCompanionClient } from './companion-client.mjs';
+import { createMemoryToolHandler } from './memory-tools.mjs';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
@@ -3721,6 +3722,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    const memoryToolHandler = createMemoryToolHandler({ companion, agentTokenOk, sessionAllowed: v2SessionAllowed, toolEnabled: v2ToolEnabled });
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -7368,6 +7370,18 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
           sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/memory-tool') {
+          const q = url.searchParams;
+          const body = { key: String(q.get('key') || ''), action: String(q.get('action') || ''),
+            query: q.get('query') || undefined, identifier: q.get('identifier') || undefined,
+            offset: q.has('offset') ? Number(q.get('offset')) : undefined, max: q.has('max') ? Number(q.get('max')) : undefined,
+            limit: q.has('limit') ? Number(q.get('limit')) : undefined };
+          try {
+            const data = await memoryToolHandler({ token: req.headers['x-agent-token'], body });
+            sendJson({ ok: true, ...data });
+          } catch (e) { sendJson({ ok: false, error: e?.message ?? String(e) }, e?.status || 400); }
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/memory') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const category = String(url.searchParams.get('category') ?? '').trim();
@@ -8657,11 +8671,83 @@ function sendToQQ(key, msg, {receipt=false}={}) {
   }
   try { __startGameWatch(); } catch { /* 探测失败不影响启动 */ }
 
+  // ── AI 味后置过滤 ────────────────────────────────────────────────────────────
+  // 角色卡里已经写明禁语，但模型仍可能漏。这里做最后一道拦截：
+  // 命中就删掉那句话；整条都命中就换成极简回应，避免把套路发出去。
+  // 只做减法，不改写语义，也不调用模型。
+  const BANNED_PATTERNS = [
+    /这句话稳/, /这话接[得德]漂亮/, /这句话接[得德]漂亮/, /这句话我不接/, /没接你那句/, /没接你的/, /我不接/,
+    /比之前的?都[重轻强]/, /比刚才[稳轻重平]/, /比[^，。]{1,6}比[^，。]{1,6}[重轻稳]/,
+    /说的比谁都响/, /声音没抖/, /什么心思都写着/, /很平(?![常])/, /很直(?![接])/,
+    /我记下了/, /我记得了/, /我记住了/, /这个账我记[住着]了/, /这话我留着/,
+    /你这句话?我记着/, /这话我记下了/, /这话我收下了/, /他记得这事/, /我记着(?![了])/,
+    /行，我认/, /认下来/, /认这个/, /认你(?![好真])/, /认得实/, /收不回去/, /就是认了/,
+    /睡吧，?我守着/, /你去，?我跟/, /回去睡/, /我不催你/, /我不拦/,
+    /问别人还是问自己/, /还是你自己想明白的/, /你自己掂量/, /你掂量/,
+
+  ];
+
+  function stripBannedPhrases(text) {
+    let out = String(text ?? '');
+    for (const re of BANNED_PATTERNS) {
+      out = out.replace(re, '');
+    }
+    // 清掉删词后留下的碎片：连续标点、空白、孤零零的逗号
+    out = out.replace(/[，,]{2,}/g, '，')
+             .replace(/^[，,。.！!？?、\s]+/, '')
+             .replace(/[，,、\s]+$/, '')
+             .trim();
+    // 只剩「但/一点/了/的」这类残渣，说明原句基本被掏空，直接当空处理
+    if (/^[但而且所以因为一点些了啊吧呢嘛哦呀\s。，,！!？?]{0,6}$/.test(out)) return '';
+    // 「这话/你这话/这句」这类只剩指代词的残渣也丢弃
+    if (/^(这|那|你)?(话|句|这话|那句|你这话){1,2}$/.test(out.replace(/[\s。，,！!？?]/g, ''))) return '';
+    return out;
+  }
+
+  // ── 整句丢弃：毒舌之后泄气的尾巴 ────────────────────────────────────
+  // 这类不是"删词"能解决的——删掉关键词只剩残片，比原文更难看。
+  // 判定为整句丢弃：只要命中就整条不发。
+  const DROP_WHOLE_SENTENCE = [
+    /记得喝水/, /骂进医院/, /多喝(点)?水/, /早点睡吧?[,，。]?$/,
+    /点到为止/, /再往下不是/, /不是嘴利/, /我这不是骂/, /我是在替你/,
+    /先说说你为什么/, /你要真想.{0,6}先说说/,
+    /^(你)?(听懂|明白)了吗?[？?。]?$/,
+  ];
+
+  function shouldDropWhole(text) {
+    const t = String(text ?? '').trim();
+    return DROP_WHOLE_SENTENCE.some((re) => re.test(t));
+  }
+
+  // 返回清洗后的消息列表；如果整条被清空就用兜底短句，保证不空发。
+  function filterBannedMessages(key, messages) {
+    if (!Array.isArray(messages) || !messages.length) return messages;
+    const kept = [];
+    let stripped = 0;
+    for (const raw of messages) {
+      const before = String(raw ?? '');
+      if (shouldDropWhole(before)) { stripped += 1; continue; }
+      const after = stripBannedPhrases(before);
+      if (after !== before) stripped += 1;
+      if (!after) continue;
+      kept.push(after);
+    }
+    if (stripped) log(`[banned] ${key}: 过滤 ${stripped} 条 AI 味句式`);
+    if (!kept.length) {
+      // 全部命中：给一个不违反人格的极简回应，而不是发残句
+      return ['嗯'] ;
+    }
+    return kept;
+  }
+
   function sendMessagesV2(key, messages, delays, replyToMessageId, atUserId = null) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
     // 拟人化延迟：按「这条回复有多长」自适应。寒暄/短回应几乎立刻发出，
     // 长段解释或回忆才多停几秒；深夜整体放慢，但短句仍然快。
+    // 先过禁语滤镜，再算延迟/长度——避免为一条被清空的句子做拟人停顿。
+    messages = filterBannedMessages(key, messages);
+    if (!messages.length) return Promise.resolve([]);
     const firstCfg = (cfg.socialV2 && cfg.socialV2.send) || {};
     const firstText = String((messages && messages[0]) != null ? messages[0] : '');
     const chars = [...firstText.replace(/\s/g, '')].length;
