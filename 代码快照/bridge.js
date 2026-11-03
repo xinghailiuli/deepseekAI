@@ -20,6 +20,7 @@ import { classifyIntent, INTENT_SYSTEM } from './mc-intent.js';
 import { createIntentClient } from './mc-intent-client.js';
 import { createActionGate, PHASES as ACTION_PHASES } from './mc-action.js';
 import { createNativeService } from './numen-native-service.js';
+import { createActionResultNotifier } from './numen-action-notifier.js';
 
 // 只读世界状态：仅主人私聊且消息涉及 MC 状态时才查询（模块级单例，避免作用域问题）。
 const MC_STATE_RE = /(minecraft|我的世界|在哪里|在哪儿|在哪|坐标|多少血|血量|生命值|维度|主世界|下界|末地|正在做什么|在做什么|在干嘛|游戏里)/i;
@@ -105,34 +106,38 @@ async function getWorldStatusRaw() {
   } catch { return null; }
 }
 
+const NUMEN_OWNER_HINT = [
+  '【Minecraft Numen 同伴原生控制】',
+  '你在主人的 Minecraft 真实世界中拥有身体（Numen 实体，名字 xiaojingyu），你可以通过以下真实工具行动：',
+  '- numen_owner_observe: 读取你与主人的实时位置、健康、当前任务与观察信息。',
+  '- numen_owner_approach: 走向主人身边（40格以内，安全避障寻路，不破坏方块）。',
+  '- numen_owner_follow: 开启持续跟随主人；如需停止请调用 numen_owner_stop。',
+  '- numen_owner_stop: 立即停止当前同伴的身体任务与所有移动。',
+  '- numen_owner_execute: 执行动作或原生采集/建造等任务（action="lua"），在安全作用域内执行。',
+  '- numen_owner_todo: 记录与更新任务清单。',
+  '- numen_owner_sense / numen_owner_skill / numen_owner_api: 感知周围实体/方块、查看技能指南与原生API。',
+  '- numen_owner_say: 在游戏内说话（游戏内回合使用）。',
+  '使用规则：',
+  '1. 调用任何 numen_owner_* 工具时，sourceMessageId 必须填写本次主人消息的真实 messageId（来自快照或上下文），不得伪造。',
+  '2. 绝不要在回复末尾添加 [[MC:...]] 等旧标记，不要尝试调用 mc_come_to_me 等旧工具。',
+  '3. 动作工具返回 dry-run / unknown / rejected 时，代表动作未执行或结果未确认，禁止盲目重试；真实执行成功后再如实向主人回复。',
+  '4. 正常自然地与主人聊天，不要向主人汇报工具名、JSON 或接口细节。',
+].join('\n');
+
 async function __augmentOwnerPrompt(key, text, native = false) {
-  if (native) return text;
   try {
     const t = String(text ?? '');
     if (!__ownerPrivateKey || String(key) !== __ownerPrivateKey) return t;
-    if (t.indexOf('【你的 Minecraft 实时状态】') >= 0) return t;
+    if (t.indexOf('【Minecraft Numen 同伴原生控制】') >= 0 || t.indexOf('【你的 Minecraft 实时状态】') >= 0) return t;
     let out = t;
     const world = await getWorldStatus();
     if (world) out += '\n\n' + world;
-    if (world) out += '\n\n' + ACTION_HINT;
-    // 本回合的 turn nonce：模型调用 mc_come_to_me 时必须原样回传。
-    try {
-      const sessIds = [...reverse.entries()].filter(([, k]) => k === key).map(([s]) => s);
-      for (const sid of sessIds) {
-        const t = __actionTurns.get(sid);
-        if (t && t.nonce) { out += '\n\n【本回合 turn nonce】' + t.nonce + '\n调用 mc_come_to_me 时必须原样填入 nonce 参数；这是本回合专属，不要复用旧的。'; break; }
-      }
-    } catch {}
-    let evBlock = null;
-    try {
-      const ev = readRecentToolEvents('E:/hmcl/.minecraft/versions/1.21.1-NeoForge_21.1.264/config/numen/companions/a444a65c-ad96-4db0-b108-42f23e9c1899/chat.jsonl');
-      evBlock = formatEventBlock(ev, { companionName: '你' });
-    } catch {}
-    if (evBlock) out += '\n\n' + evBlock;
-    log('[mc-inject] 注入 ' + key + ' 状态=' + (world ? 'ok' : 'unknown') + ' 事件=' + (evBlock ? 'yes' : 'no'));
+    out += '\n\n' + NUMEN_OWNER_HINT;
+    log('[mc-inject] 注入 ' + key + ' 状态=' + (world ? 'ok' : 'unknown') + ' 原生控制=yes');
     return out;
   } catch (e) { log('[mc-inject] 异常 ' + (e?.message ?? e)); return text; }
 }
+
 const mcCommand = createMcCommand({
   // Token 未轮换前保持 dryRun（安全阻塞项）
   enabled: () => false,
@@ -2839,12 +2844,15 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
     const sid=state.sessions[key];
     return key===`private:${cfg.ownerQQ}`&&nativeService.hasPendingDialogue?.()&&yieldedIdleTurns.has(sid+':'+nativeService.currentTurn(sid));
   }
+  const actionNotifier = createActionResultNotifier({
+    sendToQQ,
+    ownerQQ: cfg.ownerQQ,
+    redactSensitiveText,
+    log
+  });
   const nativeService = createNativeService({ root: ROOT, config: cfg,
     isControlConnected:()=>dshReady&&snowlumaHealthSnapshot().good===true,
-    onActionResult:async result=>{
-      const labels={approach:'靠近',follow:'跟随',stop:'停止'},states={arrived:'已到达并稳定停留',paused:'已暂停跟随，等待危险解除',resumed:'危险解除，已恢复原跟随',completed:result.nativeCompleted?'原生靠近已完成，本次未确认稳定停留':'已完成',cancelled:'已取消，身体已停止','timed-out':'当前任务超时并停止',failed:'当前任务失败，身体已停止',unknown:'结果未确认，后续移动已锁定'};
-      return sendToQQ(`private:${cfg.ownerQQ}`,`【Minecraft ${labels[result.operation]??'动作'}】${states[result.status]??result.status}${result.reason?'：'+redactSensitiveText(String(result.reason)).slice(0,180):''}`,{receipt:true});
-    },
+    onActionResult: result => actionNotifier.handleActionResult(result),
     canPollEvents: () => dshReady && !promptQueues.has(`private:${cfg.ownerQQ}`) && !v2TurnStartAt.has(state.sessions[`private:${cfg.ownerQQ}`]),
     prepareGameDispatch: async event => {
       if(event.playerUuid!=='2229b29d-1b60-4f99-a4a4-2692faae5cae'||event.companionUuid!=='a444a65c-ad96-4db0-b108-42f23e9c1899'||event.saveId!=='QA_QQtest'||event.sourceType!=='numen-conversation')return;
@@ -12101,7 +12109,7 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
       }
       throw error;
     }
-    promptText = await __augmentOwnerPrompt(key, promptText);
+    promptText = await __augmentOwnerPrompt(key, promptText, nativeService?.enabled);
     let content = [{ type: 'text', text: withSlangContext(promptText) }];
     if (Array.isArray(mediaList) && mediaList.length > 0) {
       const imageParts = await resolveMediaList(mediaList);

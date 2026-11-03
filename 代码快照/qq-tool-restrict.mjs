@@ -176,6 +176,7 @@ const SAFE_PREFIXES = [
   'mcp__web-search-safe__', // 联网搜索/抓取：只读，SSRF 防护在 MCP 内部
   'mcp__github__',          // GitHub：只读仓库/issue/PR（2026-10-30 恢复）
   'mcp__diary__',           // 日记：只追加，写进她自己的写作目录（2026-10-30 恢复）
+  'mcp__minecraft__',       // 旧 Minecraft（未被 routing block 阻断时放行）
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
@@ -183,6 +184,9 @@ const SAFE_PREFIXES = [
 const SAFE_EXACT = new Set([
   'ask_user_question',
   'todo_write',
+  'mc_status',
+  'mc_last_actions',
+  'mcp__numen__list_companions',
 ]);
 
 // 「分流已启用」标志：该文件存在时，旧 Minecraft MCP（假玩家）工具一律拒绝执行。
