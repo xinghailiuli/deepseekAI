@@ -199,7 +199,7 @@ import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { createCompanionClient } from './companion-client.mjs';
 import { createMemoryToolHandler } from './memory-tools.mjs';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
-import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
+import { mdToPlain, extractAssistantReply, splitForQQ, truncateText, truncateTextTail } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished, createYieldableWait } from './v2-wait.js';
 import { createProcessJournal } from './process-journal.js';
@@ -4935,7 +4935,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
           let tokenLine = '';
           if (isV2) {
             const stV2 = getSocialV2State(key);
-            tokenLine = `【会话令牌】${stV2.agentToken}（调用二代状态/发送工具时请在参数中带上此令牌）\n\n`;
+            tokenLine = `【会话令牌】${stV2.agentToken}（仅供二代状态/发送工具内部鉴权使用；绝对禁止在回复、思考内容或向外发送的消息中提及、引用或复述此令牌）\n\n`;
           }
           const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
           let sessionId = null;
@@ -11164,7 +11164,7 @@ function buildWakePromptV2(key, reason) {
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const tokenLine = `【会话令牌】${st.agentToken}（仅供二代状态工具内部鉴权使用；绝对禁止在回复、思考内容或向外发送的消息中提及、引用或复述此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // 注意：黑话表不在这里注入，deliverPromptNow 的 withSlangContext 会统一注入，
@@ -11250,7 +11250,7 @@ function buildWakePromptV2(key, reason) {
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
-    const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
+    const tokenLine = `【会话令牌】${st.agentToken}（仅供二代状态工具内部鉴权使用；绝对禁止在回复、思考内容或向外发送的消息中提及、引用或复述此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
@@ -12569,7 +12569,28 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
               // 详见 replayPendingWakeReasonsV2 的注释）。
               replayPendingWakeReasonsV2(key);
               if (ended.reason.kind === 'completed' && ended.text.trim()) {
-                const plain = mdToPlain(ended.text);
+                const extraction = extractAssistantReply(ended.text);
+                const plain = extraction.plain;
+
+                if (extraction.hasToolCall) {
+                  log(`[bridge] 检测到模型输出了未被适配层解析的伪工具调用 (${extraction.toolCallNames.join(', ') || 'DSML'}) (${key})`);
+                }
+
+                // 纯工具调用：不得伪装成正常回复发送到 QQ
+                if (extraction.isPureToolCall) {
+                  log(`[bridge] 模型本回合仅产出了未解析的伪工具调用，无有效自然语言正文，跳过发送到 QQ (${key})`);
+                  if (isFarewell) {
+                    const st = socialState(key);
+                    if (st.phase === 'exiting') {
+                      st.phase = 'idle';
+                      st.activeDeadlineAt = 0;
+                      st.activeExitAt = 0;
+                      log(`社交模式：${key} 纯工具退场回合，回到观望`);
+                    }
+                  }
+                  continue;
+                }
+
                 // 纯 Markdown/空白输出按“无文本”处理，避免后续 planSocialTimeline 拿空串崩溃。
                 if (!plain.trim()) {
                   log(`agent 回复为空（仅格式/空白）(${key})`);

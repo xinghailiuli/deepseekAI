@@ -29,19 +29,29 @@ Save-Status @{ phase = 'start'; at = (Get-Date).ToString('s') }
 
 if ($DelaySeconds -gt 0) { Log "延迟 $DelaySeconds 秒"; Start-Sleep -Seconds $DelaySeconds }
 
-# 1) 杀掉全部 DSH 进程，最多 5 轮
+# 1) 优雅请求全部 DSH 进程退出，严禁随意强杀损坏数据库
 $killed = 0
-for ($round = 1; $round -le 5; $round++) {
+for ($round = 1; $round -le 3; $round++) {
   $procs = @(Get-Process -Name $dshName -ErrorAction SilentlyContinue)
   if ($procs.Count -eq 0) { break }
-  Log ("第 $round 轮停止进程: " + (($procs | ForEach-Object { $_.Id }) -join ','))
+  Log ("第 $round 轮优雅停止进程: " + (($procs | ForEach-Object { $_.Id }) -join ','))
   foreach ($p in $procs) {
-    try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $killed++ } catch { Log ("停止失败 PID=" + $p.Id + ": " + $_.Exception.Message) }
+    try {
+      if ($p.MainWindowHandle -ne 0) { $p.CloseMainWindow() | Out-Null }
+    } catch {}
   }
   Start-Sleep -Seconds 3
 }
 $left = @(Get-Process -Name $dshName -ErrorAction SilentlyContinue)
-Log ("已停止 $killed 个进程；剩余 " + $left.Count)
+if ($left.Count -gt 0) {
+  Log ("优雅停止后仍有后台进程残留，执行清理: " + (($left | ForEach-Object { $_.Id }) -join ','))
+  foreach ($p in $left) {
+    try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; $killed++ } catch {}
+  }
+  Start-Sleep -Seconds 2
+}
+$left = @(Get-Process -Name $dshName -ErrorAction SilentlyContinue)
+Log ("剩余 DSH 进程数: " + $left.Count)
 Save-Status @{ phase = 'stopped'; killed = $killed; left = $left.Count; at = (Get-Date).ToString('s') }
 
 # 2) 等 19387 真正释放（最多 30 秒）
@@ -52,9 +62,23 @@ for ($i = 0; $i -lt 15; $i++) {
 }
 Log ("端口 19387 已释放 = $freed")
 
-# 3) 重新启动
+# 3) 重新启动（以 D 盘统一受管配置启动，带入 DSH_HOME 与临时目录）
+$dshLauncher = 'D:\deepseenhanress\_dsh\ops\start-dsh.cmd'
+$env:DSH_HOME = 'D:\deepseenhanress\_dsh\home'
+$env:TEMP = 'D:\deepseenhanress\_dsh\tmp'
+$env:TMP = 'D:\deepseenhanress\_dsh\tmp'
+Remove-Item env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+
 if (-not (Test-Path $exe)) { Log ("找不到可执行文件: $exe"); Save-Status @{ phase = 'failed'; reason = 'exe-missing' }; exit 1 }
-try { Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe); Log '已启动 DSH' }
+try {
+  if (Test-Path $dshLauncher) {
+    Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$dshLauncher`"" -WindowStyle Hidden
+    Log '已通过受管入口 start-dsh.cmd 启动 DSH'
+  } else {
+    Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+    Log '已启动 DSH 原生主程序'
+  }
+}
 catch { Log ("启动失败: " + $_.Exception.Message); Save-Status @{ phase = 'failed'; reason = 'spawn'; error = $_.Exception.Message }; exit 1 }
 
 # 4) 等端口就绪（最多 120 秒）
