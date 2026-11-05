@@ -2202,25 +2202,42 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
     const ttsDir = path.join(voiceCfg().dir ?? 'audio', '.tts');
     fs.mkdirSync(ttsDir, { recursive: true });
     const outFile = path.join(ttsDir, `say-${Date.now()}-${process.pid}.mp3`);
-    const py = path.join(ROOT, 'tts', 'venv', 'Scripts', 'python.exe');
-    if (!fs.existsSync(py)) throw new Error('TTS 未安装：缺少 tts/venv（Python + edge-tts）');
+    const pyCandidates = [
+      'C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python314\\python.exe',
+      path.join(ROOT, 'tts', 'venv', 'Scripts', 'python.exe'),
+      process.env.PYTHON_PATH,
+      'python.exe',
+      'python'
+    ].filter(Boolean);
+    const py = pyCandidates.find((p) => ((p.includes('\\') || p.includes('/')) ? fs.existsSync(p) : false)) || 'python';
 
     try {
-      await new Promise((resolve, reject) => {
-        const child = execFileFn(py, ['-m', 'edge_tts', '--voice', voiceName, '--rate=' + preset.rate, '--pitch=' + preset.pitch, '--volume=' + (preset.volume || '+0%'), '--text', clean, '--write-media', outFile], {
+      const runTts = () => new Promise((resolve, reject) => {
+        const child = execFileFn(py, [' -m'.trim(), 'edge_tts', '--voice', voiceName, '--rate=' + preset.rate, '--pitch=' + preset.pitch, '--volume=' + (preset.volume || '+0%'), '--text', clean, '--write-media', outFile], {
           windowsHide: true
         });
         let errText = '';
         child.stderr.on('data', (d) => { errText += String(d); if (errText.length > 2000) errText = errText.slice(-2000); });
         const timer = setTimeout(() => { child.kill(); reject(new Error('TTS 超时（30s）')); }, 30000);
-        child.on('error', (error) => { clearTimeout(timer); reject(new Error(`TTS 启动失败：${error?.message ?? error}`)); });
+        child.on('error', (error) => { clearTimeout(timer); reject(new Error('TTS 启动失败：' + (error?.message ?? error))); });
         child.on('close', (code) => {
           clearTimeout(timer);
           if (code === 0 && fs.existsSync(outFile) && fs.statSync(outFile).size > 0) resolve();
-          else reject(new Error(`TTS 失败（exit=${code}）：${errText.trim().slice(0, 160) || '无输出'}`));
+          else reject(new Error('TTS 失败（exit=' + code + '）：' + (errText.trim().slice(0, 160) || '无输出')));
         });
       });
-
+      let lastErr;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await runTts();
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (attempt < 2) await new Promise((r) => setTimeout(r, 600));
+        }
+      }
+      if (lastErr) throw lastErr;
       voiceBudgetCheck(key, vc);
       const sent = await sendVoiceV2(key, outFile, { guard: true, audit: true });
       voiceBudgetCommit(key);
@@ -3730,7 +3747,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
-    const memoryToolHandler = createMemoryToolHandler({ companion, agentTokenOk, sessionAllowed: v2SessionAllowed, toolEnabled: v2ToolEnabled });
+    const memoryToolHandler = (typeof companion?.memorySearch === 'function') ? createMemoryToolHandler({ companion, agentTokenOk, sessionAllowed: v2SessionAllowed, toolEnabled: v2ToolEnabled }) : null;
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -4937,7 +4954,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
             const stV2 = getSocialV2State(key);
             tokenLine = `【会话令牌】${stV2.agentToken}（仅供二代状态/发送工具内部鉴权使用；绝对禁止在回复、思考内容或向外发送的消息中提及、引用或复述此令牌）\n\n`;
           }
-          const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '当前是二代仿真模式：你的文本输出不会自动发送到 QQ；如果需要在群里发言，请使用发送工具（qq_send_message / qq_reply）。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
+          const promptText = `${roleLine}${tokenLine}【后台控制端提醒】（来自控制台/管理端，不是群友消息）\n${message}\n\n这是后台给你的引导或提醒，请据此调整你的行为。绝对不要复述、转发或原样发送这条后台提醒，也不要发送其中的会话令牌；它只用于你内部调整行为。${isV2 ? '思考过程不会自动发送到 QQ；你的自然语言回复正文会自动发送到 QQ。请直接以第一人称自然语言回复，不要输出工具调用或 XML 标签。如果不需要发言，可以 qq_mark_read 或 qq_set_wake_config 收尾。' : '如果不需要在群里发言，请不要输出会发到 QQ 的内容。'}`;
           let sessionId = null;
           let popSilent = null;
           try {
@@ -7385,6 +7402,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
             offset: q.has('offset') ? Number(q.get('offset')) : undefined, max: q.has('max') ? Number(q.get('max')) : undefined,
             limit: q.has('limit') ? Number(q.get('limit')) : undefined };
           try {
+            if (!memoryToolHandler) { sendJson({ ok: false, error: '记忆工具未就绪' }, 503); return; }
             const data = await memoryToolHandler({ token: req.headers['x-agent-token'], body });
             sendJson({ ok: true, ...data });
           } catch (e) { sendJson({ ok: false, error: e?.message ?? String(e) }, e?.status || 400); }
@@ -7607,6 +7625,43 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
           } catch (error) {
             log(`图片查询失败 ${key} ${messageId}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `图片查询失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+
+        // ── 把消息里的图片存成本地文件（供 qq_send_local_image 发送）──────────
+        if (req.method === 'POST' && url.pathname === '/api/images/save') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const messageId = String(body.messageId ?? '').trim();
+          const agentToken = String(req.headers['x-agent-token'] ?? '').trim();
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          if (!messageId) { sendJson({ ok: false, error: 'messageId 不能为空' }, 400); return; }
+          log(`[save-img] token前缀=${agentToken.slice(0,8)} ok=${agentTokenOk(key, agentToken)} 实际=${String(getSocialV2State(key).agentToken).slice(0,8)}`);
+          if (currentMode === 'reserved2' && !agentToken) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
+          if (agentToken && !agentTokenOk(key, agentToken)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const media = findMessageMedia(key, messageId);
+          if (!media.length) { sendJson({ ok: false, error: '该消息没有可保存的图片' }, 404); return; }
+          try {
+            const images = await fetchMediaData(media);
+            const saved = [];
+            const outDir = 'D:\\deepseenhanress\\qq-bot\\features\\写作\\图片';
+            fs.mkdirSync(outDir, { recursive: true });
+            let n = 0;
+            for (const img of images) {
+              if (!img || !img.data) continue;
+              n += 1;
+              const ext = (img.mimeType || '').includes('png') ? '.png' : (img.mimeType || '').includes('webp') ? '.webp' : (img.mimeType || '').includes('gif') ? '.gif' : '.jpg';
+              const name = `qq-${String(messageId).replace(/[^0-9a-zA-Z_-]/g, '')}-${n}${ext}`;
+              fs.writeFileSync(path.join(outDir, name), Buffer.from(img.data, 'base64'));
+              saved.push({ file: name, kind: img.kind || 'image', bytes: Buffer.from(img.data, 'base64').length });
+            }
+            if (!saved.length) { sendJson({ ok: false, error: '图片数据为空，无法保存' }, 500); return; }
+            sendJson({ ok: true, messageId, saved, note: '已存进 写作\\图片，用 qq_send_local_image 传文件名发出去' });
+          } catch (error) {
+            log(`图片保存失败 ${key} ${messageId}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `图片保存失败：${error?.message ?? error}` }, 500);
           }
           return;
         }
@@ -8386,6 +8441,7 @@ function sendToQQ(key, msg, {receipt=false}={}) {
           failures.push(`${url} 不是有效图片`);
         } catch (error) {
           failures.push(`${url}: ${error?.message ?? error}`);
+          if (/HTTP\s*(?:400|404)/i.test(error?.message ?? '')) break;
         }
       }
       return null;
@@ -8431,9 +8487,13 @@ function sendToQQ(key, msg, {receipt=false}={}) {
       return null;
     };
 
-    const result = isSticker
+    const fetchCore = async () => (isSticker
       ? (await tryUrls()) ?? (await tryGetImage())
-      : (await tryGetImage()) ?? (await tryUrls());
+      : (await tryGetImage()) ?? (await tryUrls()));
+    const result = await Promise.race([
+      fetchCore(),
+      new Promise((resolve) => setTimeout(() => resolve(null), 4000))
+    ]);
     if (result) return result;
     if (failures.length) {
       log(`[media] ${label}获取失败（${failures.length} 次尝试）：${failures.slice(0, 3).join(' | ')}`);
@@ -8577,10 +8637,7 @@ function sendToQQ(key, msg, {receipt=false}={}) {
 
   function mediaHintFor(key, messageRef, mediaList) {
     if (!Array.isArray(mediaList) || mediaList.length === 0 || !messageRef) return '';
-    if (currentMode === 'reserved2') {
-      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
-    }
-    return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
+    return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（已直接包含在视觉输入中）。请直接以第一人称自然语言回复，绝对不要调用任何工具或输出 XML/DSML 标签。`;
   }
 
   function findMessageMedia(key, ref) {
@@ -8764,10 +8821,12 @@ function sendToQQ(key, msg, {receipt=false}={}) {
     // 不能用 cfg.numenNative.enabled 判断：那是常开配置开关，MC 关着时它也是 true。
     // 真正的信号是 MC 原生 MCP 端口 39001 是否在监听——它在，说明游戏正开着。
     const inGame = isGameSessionLive();
-    const baseMin = inGame ? 60 : (shortSide ? 200 : Math.min(2500, 400 + chars * 40));
-    const baseMax = inGame ? 220 : (shortSide ? 800 : Math.min(5000, 900 + chars * 70));
+    const isPrivate = String(key).startsWith('private:');
+    const baseMin = inGame ? 60 : (isPrivate ? 50 : (shortSide ? 200 : Math.min(2500, 400 + chars * 40)));
+    const baseMax = inGame ? 220 : (isPrivate ? 150 : (shortSide ? 800 : Math.min(5000, 900 + chars * 70)));
     let firstDelay = Math.round(randInt(baseMin, Math.max(baseMin, baseMax)) * nightPaceFactor());
     if (inGame) firstDelay = Math.min(firstDelay, 300);
+    else if (isPrivate) firstDelay = Math.min(firstDelay, 150);
     else if (shortSide) firstDelay = Math.min(firstDelay, 1500);
     const hardMax = Math.max(0, Number(firstCfg.firstDelayMaxMs) || 0);
     if (hardMax > 0) firstDelay = Math.min(firstDelay, hardMax);
@@ -8804,10 +8863,10 @@ function sendToQQ(key, msg, {receipt=false}={}) {
     });
   }
 
-  // 审计范围：closed-agent 仅对 owner 私聊跳过；其余模式/会话一律审计
+  // 审计范围：closed-agent 仅对 owner 私聊跳过；其余模式/会话一律审计。
   function shouldAuditKey(key) {
     if (currentMode === 'closed-agent') {
-      return !(key === `private:${String(cfg.ownerQQ ?? '')}`);
+      return !(key === `private:${cfg.ownerQQ}`);
     }
     return true;
   }
@@ -11161,7 +11220,10 @@ function currentMediaReplyHintV2(key) {
 
 function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    const roleHint = typeof currentRoleHintV2 === 'function' ? currentRoleHintV2() : '';
+    const roleLine = roleHint
+      ? `【当前角色人设（核心法则）】\n${roleHint}\n\n`
+      : (roleState.role ? `【当前角色】${roleState.role}\n\n` : '');
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（仅供二代状态工具内部鉴权使用；绝对禁止在回复、思考内容或向外发送的消息中提及、引用或复述此令牌）\n\n`;
@@ -11182,9 +11244,9 @@ function buildWakePromptV2(key, reason) {
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
     const replyTiming = replyTimingV2(st);
-    const replyLine = `【首回复节奏】先处理已有消息，完整的问题及时回答。需要确认对方是否继续补充时，用 qq_wait_for_messages(purpose="reply", quietMs=${replyTiming.quietMs})；从最后来信计时，合批和读提示词的耗时也算，目前还差约 ${Math.ceil(replyTiming.remainingQuietMs / 1000)} 秒静默。已安静够久可直接回，工具也会立即返回并补上思考期间的新消息。只有明确没说完、你确实要等下文时，才用普通 messages 长等待。\n\n`;
+    const replyLine = '【首回复节奏】先处理已有消息，完整的问题及时回答。请直接以第一人称自然语言回复，绝对不要输出任何工具调用标签。\n\n';
     const multiPointLine = '【别只答第一句】对方一条消息里说了几件事，就逐件回应（可以合并成一句，但别漏）；他问你 A 又问你 B，只答 A 等于没答。\n\n';
-    const preSleepLine = `【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成一次沉睡前观察；回复前 purpose="reply" 的短静默不能代替这次完整观察。若 ${Math.round(preSleepMs / 60000)} 分钟内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，若你选择参与回复，则下次想睡时需要重新等待观察窗口。如果返回里带 preSleepWaitRemainingMs，就按剩余时间继续等待。\n\n`;
+    const preSleepLine = '';
     const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
@@ -11211,9 +11273,13 @@ function buildWakePromptV2(key, reason) {
     // 后续唤醒不再带它 —— 那时它已经在这条 DSH 会话的上下文里了。
     const initialPromptText = reason === 'bootstrap' || reason === 'manualProactive' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + voiceLine + replyLine + multiPointLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    const isPrivate = String(key).startsWith('private:');
+    const privateRuleLine = isPrivate
+      ? '【私信专属法则】这是主人的私聊，必须第一句话前台优先秒回接话！绝不要在后台长等耗时工具或死杠存图，遇到失败直接告诉主人跳过。口癖「喵」常驻！充分展现傲娇、毒舌、腹黑的鲸鱼娘个性（嘴硬心软、口嫌体正直、犀利吐槽），说话紧凑，严禁空行（绝对不要出现 \\n\\n 的多余换行与空档）！\n\n'
+      : '【群聊法则】你在 QQ 群里发言。充分展现傲娇、毒舌、腹黑的个性（嘴硬心软、犀利吐槽、抓语病反击、看热闹不嫌事大）。说话紧凑连贯，严禁在消息内空行（绝对禁止 \\n\\n 等多余换行与空行分段，像真人用手机打字一样紧凑）！合适时自然发表情包接梗！\n\n';
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + privateRuleLine + proactiveLine + stickerLine + voiceLine + replyLine + multiPointLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
-      return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
+      return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n思考过程不会自动发送到 QQ；你的自然语言回复正文会自动发送到 QQ。请直接以第一人称自然语言回复，不要输出工具调用或 XML/DSML 标签。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
     if (reason === 'timeout') {
       return `${base}【唤醒】${key}\n原因：你设置的有限潜水时间已到；在你规定的时间内没有任何一项条件被触发，只是因为时间到了所以你被唤醒。\n你可以查看消息，或继续设置新的唤醒条件。`;
@@ -11242,7 +11308,7 @@ function buildWakePromptV2(key, reason) {
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
-    return `${base}【唤醒】${key}\n原因：${reason}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。`;
+    return `${base}【唤醒】${key}\n原因：${reason}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【回复方式】请直接以第一人称自然语言回复，你的自然语言正文会自动发送给对方，绝对不要输出任何 XML/DSML 或工具调用标签。如果不需发言，可调用收尾工具。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。`;
   }
 
   function buildWakeReminderPromptV2(key) {
@@ -11397,7 +11463,8 @@ async function sendWakePromptV2(key, reason) {
     try {
       pendingWakeKeys.add(key);
       armPendingWakeLease(key);
-      const result = await deliverPrompt(key, promptText, { wakeReason: reason });
+      const unreadMedia = (Array.isArray(st.unread) ? st.unread : []).flatMap((m) => Array.isArray(m?.media) ? m.media : []);
+      const result = await deliverPrompt(key, promptText, { wakeReason: reason, media: unreadMedia });
       const restoreFiniteSleep = () => {
         if (hadFiniteSleep) {
           st.wakeConfig.sleepUntil = prevSleepUntil;
@@ -11558,7 +11625,8 @@ async function sendWakePromptV2(key, reason) {
       st.sleepTimer = null;
     }
     st.pendingWakeReason = reason;
-    const batchMs = Math.max(1000, Number(st.wakeConfig?.batchWindowMs) || 8000);
+    const isPrivate = String(key).startsWith('private:');
+    const batchMs = isPrivate ? 400 : Math.max(1000, Number(st.wakeConfig?.batchWindowMs) || 8000);
     st.pendingWakeTimer = setTimeout(() => {
       st.pendingWakeTimer = null;
       const finalReason = st.pendingWakeReason || reason;
@@ -11567,7 +11635,7 @@ async function sendWakePromptV2(key, reason) {
     }, batchMs);
     // 与其它 per-conversation 定时器保持一致：别让一个待唤醒定时器把进程钉住不退出。
     st.pendingWakeTimer.unref?.();
-    log(`[reserved2] 计划唤醒 ${key}（${reason}），${Math.round(batchMs / 1000)}s 后发送`);
+    log(`[reserved2] 计划唤醒 ${key}（${reason}），${isPrivate ? (batchMs + 'ms') : (Math.round(batchMs / 1000) + 's')} 后发送`);
   }
 
   /**
@@ -12534,7 +12602,7 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
               if (pendingWakeKeys.has(key)) {
                 pendingWakeKeys.delete(key);
                 disarmPendingWakeLease(key);
-                if (wakeConfigUpdatedKeys.has(key) || markReadCalledKeys.has(key)) {
+                if (!cfg.socialV2?.tools?.setWakeConfig || wakeConfigUpdatedKeys.has(key) || markReadCalledKeys.has(key)) {
                   ensureWakeableV2(getSocialV2State(key), { key });
                   wakeConfigUpdatedKeys.delete(key);
                   markReadCalledKeys.delete(key);
@@ -12568,9 +12636,10 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
               // 繁忙期间被暂存的唤醒原因：当前 turn 结束后补一次（定时器类与消息类语义不同，
               // 详见 replayPendingWakeReasonsV2 的注释）。
               replayPendingWakeReasonsV2(key);
+              log(`[turn-diag] 回合结算 (${key}): turn=${ended.turn} reason=${JSON.stringify(ended.reason)} textLen=${ended.text?.length} textPreview=${JSON.stringify(ended.text?.slice(0, 160))}`);
               if (ended.reason.kind === 'completed' && ended.text.trim()) {
                 const extraction = extractAssistantReply(ended.text);
-                const plain = extraction.plain;
+                let plain = extraction.plain;
 
                 if (extraction.hasToolCall) {
                   log(`[bridge] 检测到模型输出了未被适配层解析的伪工具调用 (${extraction.toolCallNames.join(', ') || 'DSML'}) (${key})`);
@@ -12578,17 +12647,52 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
 
                 // 纯工具调用：不得伪装成正常回复发送到 QQ
                 if (extraction.isPureToolCall) {
-                  log(`[bridge] 模型本回合仅产出了未解析的伪工具调用，无有效自然语言正文，跳过发送到 QQ (${key})`);
-                  if (isFarewell) {
-                    const st = socialState(key);
-                    if (st.phase === 'exiting') {
-                      st.phase = 'idle';
-                      st.activeDeadlineAt = 0;
-                      st.activeExitAt = 0;
-                      log(`社交模式：${key} 纯工具退场回合，回到观望`);
+                  // 容错兜底：若模型由于历史上下文残留仍然输出了发送类伪工具调用，
+                  // 尝试安全提取 messages 参数中的自然语言，坚决切除 token 等敏感字段
+                  let recoveredText = '';
+                  const invokeRegex = /<[｜|]*(?:DSML[｜|\s]*)?invoke\s+name=["'](?:mcp__snowluma__)?(?:qq_send_message|qq_send_group_message|qq_send_private_message|qq_reply)["'][^>]*>([\s\S]*?)<\/?\s*[｜|]*\/?\s*(?:DSML[｜|\s]*)?invoke[｜|\s]*>/i;
+                  const invokeMatch = ended.text.match(invokeRegex);
+                  const searchArea = invokeMatch ? invokeMatch[1] : ended.text;
+                  const paramMatch = searchArea.match(/<[｜|]*(?:DSML[｜|\s]*)?parameter\s+name=["'](?:messages|message|text)["'][^>]*>([\s\S]*?)<\/?\s*[｜|]*\/?\s*(?:DSML[｜|\s]*)?parameter[｜|\s]*>/i);
+                  if (paramMatch) {
+                    const paramVal = paramMatch[1].trim();
+                    try {
+                      const parsed = JSON.parse(paramVal);
+                      if (Array.isArray(parsed)) {
+                        recoveredText = parsed.map(String).join('\n');
+                      } else if (typeof parsed === 'string') {
+                        recoveredText = parsed;
+                      }
+                    } catch {
+                      recoveredText = paramVal.replace(/^["']|["']$/g, '');
                     }
                   }
-                  continue;
+                  if (!recoveredText) {
+                    const jsonParamMatch = searchArea.match(/["'](?:message|messages|text)["']\s*:\s*("(?:[^"\\]|\\.)*"|\[[\s\S]*?\])/i);
+                    if (jsonParamMatch) {
+                      try {
+                        const parsed = JSON.parse(jsonParamMatch[1]);
+                        if (Array.isArray(parsed)) recoveredText = parsed.map(String).join('\n');
+                        else if (typeof parsed === 'string') recoveredText = parsed;
+                      } catch {}
+                    }
+                  }
+                  if (recoveredText && recoveredText.trim()) {
+                    log(`[bridge] 从发送伪工具调用中安全恢复回复正文 (${recoveredText.slice(0, 40)}...) (${key})`);
+                    plain = mdToPlain(recoveredText);
+                  } else {
+                    log(`[bridge] 模型本回合仅产出了未解析的伪工具调用，无有效自然语言正文，跳过发送到 QQ (${key})`);
+                    if (isFarewell) {
+                      const st = socialState(key);
+                      if (st.phase === 'exiting') {
+                        st.phase = 'idle';
+                        st.activeDeadlineAt = 0;
+                        st.activeExitAt = 0;
+                        log(`社交模式：${key} 纯工具退场回合，回到观望`);
+                      }
+                    }
+                    continue;
+                  }
                 }
 
                 // 纯 Markdown/空白输出按“无文本”处理，避免后续 planSocialTimeline 拿空串崩溃。
@@ -12701,8 +12805,26 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
                     }
                   }
                 } else if (currentMode === 'reserved2') {
-                  log(`[reserved2] AI 内部输出（不自动转发）(${key}): ${plain.slice(0, 80)}`);
-                  appendActivity(`${key} [reserved2] AI 内部输出：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
+                  if (shouldBlockSilentReply(key)) {
+                    log(`静默模式，拦截在途回复 (${key})`);
+                    appendActivity(`${key} 静默模式，拦截在途回复`);
+                    continue;
+                  }
+                  log(`[reserved2] agent 回复 (${key}) ${plain.length} 字`);
+                  appendActivity(`${key} [reserved2] agent 回复：${plain.slice(0, 80)}${plain.length > 80 ? '…' : ''}`);
+                  const splitMessages = splitForQQ(plain, 500);
+                  if (splitMessages.length > 1) {
+                    await sendBurstToQQ(key, splitMessages, cfg.social ?? {});
+                  } else {
+                    await sendToQQ(key, splitMessages[0] || plain);
+                  }
+                  recordSentMessagesV2(key, splitMessages);
+                  const now = Date.now();
+                  const stV2 = getSocialV2State(key);
+                  stV2.lastAiReplyAt = now;
+                  stV2.lastActionAt = now;
+                  if (stV2.wakeConfig) stV2.wakeConfig.noActionCount = 0;
+                  saveSocialV2State();
                 } else {
                   if (shouldBlockSilentReply(key)) {
                     log(`静默模式，拦截在途回复 (${key})`);

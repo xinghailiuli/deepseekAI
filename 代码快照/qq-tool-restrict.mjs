@@ -172,6 +172,7 @@ const RESTRICTED_SET = new Set(RESTRICTED_TOOL_NAMES)
 // 前缀覆盖 DSH MCP client 暴露的命名空间工具。
 const SAFE_PREFIXES = [
   'mcp__snowluma__',        // QQ：收发消息/表情/语音/记忆/唤醒配置
+  'mcp__snowluma-host__',   // QQ 宿主工具：存图/状态等
   'mcp__heybox__',          // 小黑盒：看帖/搜索/草稿/发布/评论/存图
   'mcp__web-search-safe__', // 联网搜索/抓取：只读，SSRF 防护在 MCP 内部
   'mcp__github__',          // GitHub：只读仓库/issue/PR（2026-10-30 恢复）
@@ -232,7 +233,15 @@ export function apply(ctx) {
   // 只限制其中已注册的旧命名空间，不影响 preset 内的 Numen 只读工具。
   if (routingBlockActive()) {
     try {
-      for (const { name } of ctx.tools.schemas()) {
+      const schemas = typeof ctx.tools?.schemas === 'function' ? ctx.tools.schemas() : null
+      if (schemas && typeof schemas[Symbol.iterator] === 'function') {
+        for (const { name } of schemas) {
+          if (!name.startsWith('mcp__minecraft__')) continue
+          try { ctx.tools.restrict({ deny: [name] }) }
+          catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
+        }
+      }
+      if (false) for (const { name } of []) {
         if (!name.startsWith('mcp__minecraft__')) continue
         try { ctx.tools.restrict({ deny: [name] }) }
         catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
