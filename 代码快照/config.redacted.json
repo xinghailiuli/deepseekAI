@@ -13,13 +13,16 @@
   "dsh": {
     "baseUrl": "http://127.0.0.1:19387",
     "provider": "dsh-magpie-connect",
-    "model": "opencode-zen-2/deepseek-v4.1-flash",
+    "model": "auto/deepseek-v4.1-flash",
     "reasoningEffort": "low",
     "authToken": "",
     "authHeader": "authorization",
     "authPrefix": "Bearer",
     "allowRemote": false,
-    "fallback": null
+    "fallback": {
+      "provider": "dsh-magpie-connect",
+      "model": "auto/glm-5.3-flash"
+    }
   },
   "role": {
     "maxInjectChars": 9000
@@ -160,7 +163,8 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "sendVoice": true
+      "sendVoice": true,
+      "say": true
     },
     "wake": {
       "defaultMode": "diving",
@@ -232,9 +236,9 @@
     "sticker": {
       "enabled": true,
       "syncTtlMs": 60000,
-      "maxListCount": 100,
+      "maxListCount": 500,
       "includeInPrompt": true,
-      "promptMaxStickers": 60,
+      "promptMaxStickers": 18,
       "collect": {
         "enabled": true,
         "maxPerMinute": 0,
@@ -252,16 +256,20 @@
       "allowAbsolutePath": false,
       "defaultVolume": 1,
       "loudness": "normal",
-      "ffmpegPath": "",
+      "ffmpegPath": "D:\\AI\\GPT-SoVITS-beta0706fix1\\GPT-SoVITS-beta0706\\ffmpeg.exe",
       "autoReadback": true,
-      "ttsVoice": "zh-CN-XiaoyiNeural"
+      "ttsVoice": "zh-CN-XiaoyiNeural",
+      "sovitsEnabled": true,
+      "sovitsUrl": "http://127.0.0.1:9880",
+      "sovitsSpeed": 1,
+      "sovitsTimeoutMs": 120000
     },
     "proactive": {
-      "enabled": false,
-      "checkIntervalMinMs": 720000,
-      "checkIntervalMaxMs": 2100000,
-      "idleThresholdMs": 480000,
-      "probability": 0.75
+      "enabled": true,
+      "checkIntervalMinMs": 1800000,
+      "checkIntervalMaxMs": 3600000,
+      "idleThresholdMs": 1800000,
+      "probability": 0.25
     },
     "feedback": {
       "maxLength": 500,
@@ -284,7 +292,34 @@
       "maxPixels": 64000000,
       "maxCount": 5
     },
-    "daily": []
+    "daily": [
+      {
+        "key": "private:3244998247",
+        "window": [
+          "08:30",
+          "09:30"
+        ],
+        "topics": [
+          "????",
+          "???????",
+          "???????"
+        ],
+        "reason": "dailyMorning"
+      },
+      {
+        "key": "private:3244998247",
+        "window": [
+          "22:30",
+          "23:30"
+        ],
+        "topics": [
+          "????",
+          "?????",
+          "???????"
+        ],
+        "reason": "dailyNight"
+      }
+    ]
   },
   "webSearch": {
     "provider": "auto",

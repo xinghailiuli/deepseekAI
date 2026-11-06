@@ -1,4 +1,4 @@
-﻿# 确保 adb 里有手机：优先 USB，其次上次成功的无线地址
+# 确保 adb 里有手机：优先 USB，其次上次成功的无线地址
 # 由 whale-watchdog.ps1 调用；也支持手动跑：powershell -File connect-phone-adb.ps1
 $ErrorActionPreference = 'Continue'
 $root = 'D:\deepseenhanress\qq-bot'
@@ -6,7 +6,15 @@ $stateFile = Join-Path $root 'state\phone-adb.json'
 $logDir = Join-Path $root 'logs'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 $log = Join-Path $logDir 'phone-adb.log'
-function Log($m) { ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $m) | Add-Content -Path $log -Encoding UTF8 }
+function Log($m) {
+  try {
+    if ((Test-Path $log) -and ((Get-Item $log).Length -gt 3MB)) {
+      $tail = Get-Content -Path $log -Tail 1000 -Encoding UTF8
+      [IO.File]::WriteAllLines($log, $tail, [Text.Encoding]::UTF8)
+    }
+  } catch {}
+  ("{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $m) | Add-Content -Path $log -Encoding UTF8
+}
 
 # 1) 找 adb：ADB 环境变量 → PATH → 已知位置
 $adb = $null
