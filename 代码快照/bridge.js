@@ -197,7 +197,6 @@ import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport,
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { createCompanionClient } from './companion-client.mjs';
-import { createMemoryToolHandler } from './memory-tools.mjs';
 import { NodeApiClient, unwrap, createTurnCollector, discoverDshLaunchToken } from './dsh-client.js';
 import { mdToPlain, extractAssistantReply, splitForQQ, truncateText, truncateTextTail, stripClosingSelfTalk } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
@@ -3834,7 +3833,6 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
-    const memoryToolHandler = createMemoryToolHandler({ companion, agentTokenOk, sessionAllowed: v2SessionAllowed, toolEnabled: v2ToolEnabled });
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -7488,18 +7486,6 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
           sendJson({ ok: true, key, category, memory: formatMemoryV2(st) });
           return;
         }
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/memory-tool') {
-          const q = url.searchParams;
-          const body = { key: String(q.get('key') || ''), action: String(q.get('action') || ''),
-            query: q.get('query') || undefined, identifier: q.get('identifier') || undefined,
-            offset: q.has('offset') ? Number(q.get('offset')) : undefined, max: q.has('max') ? Number(q.get('max')) : undefined,
-            limit: q.has('limit') ? Number(q.get('limit')) : undefined };
-          try {
-            const data = await memoryToolHandler({ token: req.headers['x-agent-token'], body });
-            sendJson({ ok: true, ...data });
-          } catch (e) { sendJson({ ok: false, error: e?.message ?? String(e) }, e?.status || 400); }
-          return;
-        }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/memory') {
           const key = String(url.searchParams.get('key') ?? '').trim();
           const category = String(url.searchParams.get('category') ?? '').trim();
@@ -8932,6 +8918,23 @@ function sendToQQ(key, msg, {receipt=false}={}) {
     // 长段解释或回忆才多停几秒；深夜整体放慢，但短句仍然快。
     // 先过禁语滤镜，再算延迟/长度——避免为一条被清空的句子做拟人停顿。
     messages = filterBannedMessages(key, messages);
+    // 群聊硬限长：超 25 字截断到最近句末，逼她说短句。私聊不受影响。
+    if (String(key).startsWith('group:') && Array.isArray(messages)) {
+      const GROUP_MAX_CHARS = 25;
+      messages = messages.map((m) => {
+        const t0 = String(m ?? '');
+        const chars0 = [...t0];
+        if (chars0.length <= GROUP_MAX_CHARS) return t0;
+        const head = chars0.slice(0, GROUP_MAX_CHARS);
+        let cutAt = -1;
+        for (let i = head.length - 1; i >= 0; i--) {
+          if (/[。！？!?~～]/.test(head[i])) { cutAt = i + 1; break; }
+        }
+        let out = cutAt > 0 ? head.slice(0, cutAt).join('') : head.join('');
+        out = out.replace(/[，,、；;：:]\s*$/, '').trim();
+        return out || head.join('');
+      }).filter((m) => m && m.length);
+    }
     if (!messages.length) return Promise.resolve([]);
     const firstCfg = (cfg.socialV2 && cfg.socialV2.send) || {};
     const firstText = String((messages && messages[0]) != null ? messages[0] : '');
@@ -11138,7 +11141,16 @@ function formatMemoryV2(st) {
     const tr = st.wakeConfig?.triggers ?? {};
     if (tr.anyMessage) return 'anyMessage';
     if (tr.atMention) {
-      const atSelf = Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? ''));
+      // self_id 在部分 SnowLuma 版本/历史接口里是空的，光靠它会漏掉所有 @。
+      // 这里把事件 self_id、桥接缓存的 selfUserId、事件里出现的 self_id 都当候选。
+      const selfCandidates = new Set([
+        String(event?.self_id ?? ''),
+        String(selfUserId || ''),
+        String(event?.self_id === undefined ? '' : event.self_id),
+      ].filter((x) => x && x !== 'undefined' && x !== 'null'));
+      const atSelf = Array.isArray(event?.message) && event.message.some((seg) =>
+        seg?.type === 'at' && selfCandidates.has(String(seg.data?.qq ?? '')),
+      );
       if (atSelf || quoteTargetIsSelf) return 'atMention';
     }
     if (tr.nameMention && selfNickname) {
@@ -11323,7 +11335,13 @@ async function groupHistoryBlockV2(key, limit = 15) {
     }).join('').trim();
     if (!text) continue;
     const uid = String(item?.user_id ?? '');
-    const who = uid && uid === selfId ? '我' : (item?.sender?.card || item?.sender?.nickname || uid || '某人');
+    // 标出主人：群里她看到的是满屏昵称，不标出来根本认不出哪个是主人。
+    const ownerQQStr = String(cfg.ownerQQ ?? '');
+    const who = uid && uid === selfId
+      ? '我'
+      : (ownerQQStr && uid === ownerQQStr)
+        ? '主人'
+        : (item?.sender?.card || item?.sender?.nickname || uid || '某人');
     lines.push(`${who}：${text.slice(0, 80)}`);
   }
   if (lines.length === 0) return '';
@@ -11766,12 +11784,37 @@ async function sendWakePromptV2(key, reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
   }
 
+  // ── 时效性话题静默：群友聊订阅/额度/token/政策这类事时，她插嘴只会误导。
+  // 命中就不计划唤醒，让她当没看见。私聊不拦（主人直接问她，她自己会说不知道）。
+  const TIME_SENSITIVE_RE = /(订阅|会员|套餐|额度|充值|续费|退款|涨价|降价|包月|包年|年费|月费|计费|计费方式|免费额度|限流|配额|quota|token\s*(消耗|用量|余额|价格|收费|计费)|消耗.{0,4}token|api\s*key.{0,6}(多少|贵|便宜)|余额|单价|多少钱(一|每)?(次|条|token|万)|(一次|每次|一条|每条).{0,4}多少钱)|(现在|目前|最近|今天|这个月).{0,8}(还能用|不能用了|恢复|下架|上线|改版|政策|规则改|限流)/i;
+
+  function isTimeSensitiveTopic(text) {
+    const t = String(text ?? '');
+    if (!t) return false;
+    return TIME_SENSITIVE_RE.test(t);
+  }
+
   function scheduleWakeV2(key, reason) {
     if (cfg.socialV2?.enabled === false) return;
     if (socialV2.paused) return;
     if (!isSessionAllowedInCurrentMode(key)) {
       log(`[reserved2] 跳过计划唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
+    }
+    // 群聊里碰到时效性话题（订阅/额度/token/政策）直接不接，避免误导。
+    // 只拦概率类唤醒；@ 和关键词点名仍放行，但角色卡里已写明"被问到就说不知道"。
+    if (key.startsWith('group:')) {
+      const base = String(reason ?? '').split(':')[0];
+      const probabilityOnly = base === 'probability' || base === 'timeout' || base === 'proactiveCheck';
+      if (probabilityOnly) {
+        const st0 = getSocialV2State(key);
+        const last = st0?.recentMessages?.[st0.recentMessages.length - 1];
+        const lastText = String(last?.text ?? last?.plain ?? '');
+        if (isTimeSensitiveTopic(lastText)) {
+          log(`[reserved2] 跳过计划唤醒 ${key}（${reason}）：时效性话题，不插嘴`);
+          return;
+        }
+      }
     }
     const st = getSocialV2State(key);
     if (st.pendingWakeTimer) {
@@ -12220,6 +12263,16 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
         scheduleWakeV2(key, 'bootstrap');
       } else {
         const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
+        // 临时诊断：@ 不触发时看这一行就够（不含聊天正文，只打结构）
+        if (kind === 'group') {
+          const segs = Array.isArray(event?.message) ? event.message.filter((x) => x?.type === 'at').map((x) => String(x?.data?.qq ?? '')) : [];
+          const rawMsg = event?.message;
+          const rawType = Array.isArray(rawMsg) ? 'array(' + rawMsg.length + ')' : typeof rawMsg;
+          const rawPeek = Array.isArray(rawMsg)
+            ? rawMsg.map((x) => x?.type + ':' + JSON.stringify(x?.data ?? {}).slice(0, 30)).join(' | ')
+            : JSON.stringify(rawMsg ?? null).slice(0, 120);
+          log(`[wake-debug] ${key} reason=${reason || '(空)'} self_id=${event?.self_id ?? '(无)'} at段=[${segs.join(',')}] msg类型=${rawType} 内容=${rawPeek}`);
+        }
         if (reason) {
           scheduleWakeV2(key, reason);
         }
