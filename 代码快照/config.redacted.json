@@ -49,7 +49,8 @@
       976850526,
       602705541,
       1076779817,
-      1134424310
+      1134424310,
+      143690413
     ]
   },
   "deny": {
@@ -275,7 +276,7 @@
       "maxLength": 500,
       "notifyOwnerOnError": false,
       "hideNotices": true,
-      "fatalNotify": true
+      "fatalNotify": false
     },
     "context": {
       "recentLimit": 60,
@@ -343,5 +344,14 @@
     "allowProactiveAlerts": false,
     "allowSafeInteractions": true,
     "allowNativePrograms": true
+  },
+  "groupAutoAt": {
+    "143690413": "4014362731"
+  },
+  "groupPeerChat": {
+    "143690413": {
+      "peerId": "4014362731",
+      "maxReplies": 9
+    }
   }
 }
