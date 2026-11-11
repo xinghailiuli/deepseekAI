@@ -11278,6 +11278,20 @@ function formatMemoryV2(st) {
     return before - st.unread.length;
   }
 
+  function acknowledgeAutomaticReplyV2(st) {
+    // A later arrival can be queued while the model is thinking or QQ is sending.
+    // Only acknowledge messages actually included in a delivered snapshot/tool result.
+    return acknowledgeMessagesV2(st, readThroughSeqV2(st));
+  }
+
+  function needsWakeReminderV2(key) {
+    // Every private inbound message already wakes the agent. A silent housekeeping
+    // turn can consume its follow-up messages without allowing a reply.
+    return key.startsWith('group:') && !cfg.groupPeerChat?.[key.split(':')[1]]
+      && !!cfg.socialV2?.tools?.setWakeConfig
+      && !wakeConfigUpdatedKeys.has(key) && !markReadCalledKeys.has(key);
+  }
+
   function buildWakeSnapshotV2(key) {
     const context = cfg.socialV2?.context ?? {};
     if (context.inlineWakeMessages === false || (!v2ToolEnabled('getUnread') && !v2ToolEnabled('getRecent'))) return null;
@@ -11446,7 +11460,7 @@ function currentMediaReplyHintV2(key) {
     const voiceLine = [voiceHint, currentMediaReplyHintV2(key)].filter(Boolean).join('\n\n') + '\n\n';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = isPrivate
-      ? '【私聊专注】这是与面前用户的 1 对 1 私聊。永远对面前的人用「你」，绝对严禁用第三人称「他/对方/用户」称呼面前的人！绝对不要在回复中出现第三人称自言自语旁白（例如绝不说“他一句……”、“他还真承认了”）。\n\n'
+      ? '【私聊专注】这是与面前用户的 1 对 1 私聊，每条真人消息都是对你说的，不需要@你或喊名字。接着回应对方的新话，不能以“你没喊我”为由不回复；后台排队或收尾不是对方没有发消息。永远对面前的人用「你」，绝对严禁用第三人称「他/对方/用户」称呼面前的人！绝对不要在回复中出现第三人称自言自语旁白（例如绝不说“他一句……”、“他还真承认了”）。\n\n'
       : '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
     const replyTiming = replyTimingV2(st);
     const replyLine = '【首回复节奏】先处理已有消息，完整的问题及时回答。请直接以第一人称自然语言回复，绝对不要输出任何工具调用标签。\n\n';
@@ -12900,7 +12914,7 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
               if (pendingWakeKeys.has(key)) {
                 pendingWakeKeys.delete(key);
                 disarmPendingWakeLease(key);
-                if ((key.startsWith('group:') && cfg.groupPeerChat?.[key.split(':')[1]]) || !cfg.socialV2?.tools?.setWakeConfig || wakeConfigUpdatedKeys.has(key) || markReadCalledKeys.has(key)) {
+                if (!needsWakeReminderV2(key)) {
                   ensureWakeableV2(getSocialV2State(key), { key });
                   wakeConfigUpdatedKeys.delete(key);
                   markReadCalledKeys.delete(key);
@@ -13196,7 +13210,7 @@ const mcMessageId = event?.message_id != null ? String(event.message_id) : (even
                   stV2.lastActionAt = now;
                   if (stV2.wakeConfig) stV2.wakeConfig.noActionCount = 0;
                   if (stV2.lastUnreadSeq) {
-                    acknowledgeMessagesV2(stV2, stV2.lastUnreadSeq);
+                    acknowledgeAutomaticReplyV2(stV2);
                   }
                   saveSocialV2State();
                 } else {
