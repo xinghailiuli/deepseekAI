@@ -206,6 +206,16 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished, createYieldableWait } from './v2-wait.js';
 import { createProcessJournal } from './process-journal.js';
 import { assertPrivateVoiceTarget, buildVoiceStrategyHint, buildMediaReplyHint } from './voice-policy.js';
+import {
+  DEFAULT_MAX_SAY_CHARS,
+  DEFAULT_MAX_BAR_CHARS,
+  SOVITS_CUT_PUNC,
+  resolveSayTextLanguage,
+  resolveEdgeTtsVoice,
+  splitVoiceSegments,
+  prepareSovitsText,
+  resolveEdgeTtsPythons
+} from './voice-say.js';
 import { compactModelMessage } from './qq-model-view.js';
 import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
 import { searchCandidates, materializeCandidate, readAsset } from './image-assets.js';
@@ -2240,100 +2250,143 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
     return 'normal';
   }
 
-  // 说一句话：文本 → Edge 神经语音(TTS) → 当语音条发出去。临时文件写进语音库内并立即删除。
+  function runEdgeTtsOnce(pyExe, { voiceName, preset, text, outFile, timeoutMs }) {
+    return new Promise((resolve, reject) => {
+      const child = execFileFn(
+        pyExe,
+        ['-m', 'edge_tts', '--voice', voiceName, '--rate=' + preset.rate, '--pitch=' + preset.pitch, '--volume=' + (preset.volume || '+0%'), '--text', text, '--write-media', outFile],
+        { windowsHide: true }
+      );
+      let errText = '';
+      child.stderr.on('data', (d) => { errText += String(d); if (errText.length > 2000) errText = errText.slice(-2000); });
+      const timer = setTimeout(() => { child.kill(); reject(new Error(`TTS 超时（${Math.round(timeoutMs / 1000)}s）`)); }, timeoutMs);
+      child.on('error', (error) => { clearTimeout(timer); reject(new Error(`TTS 启动失败：${error?.message ?? error}`)); });
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0 && fs.existsSync(outFile) && fs.statSync(outFile).size > 0) {
+          resolve();
+        } else {
+          reject(new Error(`TTS 失败（exit=${code}）：${errText.trim().slice(0, 160) || '无输出'}`));
+        }
+      });
+    });
+  }
+
+  async function synthesizeSayChunk(cleanChunk, { vc, preset, voice, ttsDir, baseName }) {
+    const outWav = path.join(ttsDir, `${baseName}.wav`);
+    const sovitsUrl = String(vc.sovitsUrl || 'http://127.0.0.1:9880').replace(/\/+$/, '');
+    const textLang = resolveSayTextLanguage(cleanChunk);
+
+    if (vc.sovitsEnabled !== false) {
+      try {
+        const timeoutMs = Math.max(Number(vc.sovitsTimeoutMs ?? 120000), cleanChunk.length * 1800 + 30000);
+        const sovitsText = prepareSovitsText(cleanChunk);
+        const cutPunc = encodeURIComponent(SOVITS_CUT_PUNC);
+        const sovitsRes = await fetch(`${sovitsUrl}/?text=${encodeURIComponent(sovitsText)}&text_language=${textLang}&cut_punc=${cutPunc}`, {
+          signal: AbortSignal.timeout(timeoutMs)
+        });
+        if (sovitsRes.ok) {
+          const audioBuf = Buffer.from(await sovitsRes.arrayBuffer());
+          if (audioBuf.length > 1000) {
+            const speed = Number(vc.sovitsSpeed ?? 0.85);
+            const ffmpegExe = vc.ffmpegPath || 'ffmpeg';
+            if (speed > 0 && Math.abs(speed - 1.0) >= 0.02 && fs.existsSync(ffmpegExe)) {
+              const rawPath = outWav + '.raw.wav';
+              fs.writeFileSync(rawPath, audioBuf);
+              try {
+                execFileSync(ffmpegExe, ['-hide_banner', '-loglevel', 'error', '-y', '-i', rawPath, '-filter:a', `atempo=${speed}`, outWav], { windowsHide: true });
+              } catch {
+                fs.writeFileSync(outWav, audioBuf);
+              } finally {
+                try { fs.rmSync(rawPath, { force: true }); } catch {}
+              }
+            } else {
+              fs.writeFileSync(outWav, audioBuf);
+            }
+            return { file: outWav, engine: 'gpt-sovits', textLang, voice: `sovits:${textLang}` };
+          }
+        }
+      } catch (sovitsErr) {
+        log(`[voice] GPT-SoVITS 暂时不可用，尝试 fallback: ${sovitsErr?.message ?? sovitsErr}`);
+      }
+    }
+
+    const pyCandidates = resolveEdgeTtsPythons(ROOT);
+    if (!pyCandidates.length) throw new Error('TTS 生成失败：GPT-SoVITS 离线且缺少 edge-tts');
+    const edgeVoice = resolveEdgeTtsVoice(cleanChunk, voice, vc.ttsVoice);
+    const edgeOutFile = path.join(ttsDir, `${baseName}.mp3`);
+    const edgeTimeoutMs = Math.max(30000, cleanChunk.length * 400);
+    let lastErr = null;
+    for (const py of pyCandidates) {
+      try {
+        await runEdgeTtsOnce(py, { voiceName: edgeVoice, preset, text: cleanChunk, outFile: edgeOutFile, timeoutMs: edgeTimeoutMs });
+        return { file: edgeOutFile, engine: 'edge-tts', textLang, voice: edgeVoice };
+      } catch (err) {
+        lastErr = err;
+        try { fs.rmSync(edgeOutFile, { force: true }); } catch {}
+      }
+    }
+    throw lastErr || new Error('TTS 生成失败');
+  }
+
+  // 说一段话：文本 → GPT-SoVITS（优先，支持中文/日语/长句分段）/ Edge TTS 兜底 → 当语音条发出去。临时文件用完立即删除。
   async function sayTextV2(key, text, { label = '', voice = '', mood = '' } = {}) {
     assertPrivateVoiceTarget(key);
     const vc = voiceCfg();
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
     const clean = String(text ?? '').replace(/\s+/g, ' ').trim();
     if (!clean) throw new Error('text 不能为空');
-    if (clean.length > 120) throw new Error(`text 过长（上限 120 字，当前 ${clean.length}）`);
+    const maxSayChars = Math.max(120, Math.round(Number(vc.maxSayChars ?? DEFAULT_MAX_SAY_CHARS) || DEFAULT_MAX_SAY_CHARS));
+    if (clean.length > maxSayChars) throw new Error(`text 过长（上限 ${maxSayChars} 字，当前 ${clean.length}）`);
 
     const chosenMood = String(mood || '').trim() || inferSayMood(clean);
     const preset = SAY_MOODS[chosenMood] ?? SAY_MOODS.normal;
-    const voiceName = String(voice || cfg.socialV2?.voice?.ttsVoice || 'zh-CN-XiaoyiNeural');
-    const ttsDir = path.join(voiceCfg().dir ?? 'audio', '.tts');
-    fs.mkdirSync(ttsDir, { recursive: true });
-    const sovitsUrl = String(cfg.socialV2?.voice?.sovitsUrl || 'http://127.0.0.1:9880').replace(/\/+$/, '');
-    const outFile = path.join(ttsDir, `say-${Date.now()}-${process.pid}.wav`);
+    const maxBarChars = Math.max(60, Math.min(maxSayChars, Math.round(Number(vc.maxBarChars ?? DEFAULT_MAX_BAR_CHARS) || DEFAULT_MAX_BAR_CHARS)));
+    const segments = splitVoiceSegments(clean, maxBarChars);
+    if (!segments.length) throw new Error('text 不能为空');
 
-    try {
-      let ttsSuccess = false;
-      // 优先使用 GPT-SoVITS 专属小鲸鱼声音引擎
-      if (cfg.socialV2?.voice?.sovitsEnabled !== false) {
-        try {
-          const timeoutMs = Math.max(Number(cfg.socialV2?.voice?.sovitsTimeoutMs ?? 120000), clean.length * 1500);
-          const cutPunc = encodeURIComponent('。！？!?');
-          // 自动判断文本语言：含日文假名走纯日文通道，纯英文走英文通道，其余走中文
-          let textLang = 'zh';
-          if (/[\u3040-\u30ff]/.test(clean)) {
-            textLang = 'all_ja';
-          } else if (/^[A-Za-z0-9\s.,!?'"-\/]+$/.test(clean)) {
-            textLang = 'en';
-          }
-          const sovitsRes = await fetch(`${sovitsUrl}/?text=${encodeURIComponent(clean)}&text_language=${textLang}&cut_punc=${cutPunc}`, {
-            signal: AbortSignal.timeout(timeoutMs)
-          });
-          if (sovitsRes.ok) {
-            const audioBuf = Buffer.from(await sovitsRes.arrayBuffer());
-            if (audioBuf.length > 1000) {
-              const speed = Number(cfg.socialV2?.voice?.sovitsSpeed ?? 0.85);
-              const ffmpegExe = cfg.socialV2?.voice?.ffmpegPath || 'ffmpeg';
-              if (speed > 0 && Math.abs(speed - 1.0) >= 0.02 && fs.existsSync(ffmpegExe)) {
-                const rawPath = outFile + '.raw.wav';
-                fs.writeFileSync(rawPath, audioBuf);
-                try {
-                  execFileSync(ffmpegExe, ['-hide_banner', '-loglevel', 'error', '-y', '-i', rawPath, '-filter:a', `atempo=${speed}`, outFile], { windowsHide: true });
-                } catch {
-                  fs.writeFileSync(outFile, audioBuf);
-                } finally {
-                  try { fs.rmSync(rawPath, { force: true }); } catch {}
-                }
-              } else {
-                fs.writeFileSync(outFile, audioBuf);
-              }
-              ttsSuccess = true;
-            }
-          }
-        } catch (sovitsErr) {
-          log(`[voice] GPT-SoVITS 暂时不可用，尝试 fallback: ${sovitsErr?.message ?? sovitsErr}`);
+    const ttsDir = path.join(vc.dir ?? 'audio', '.tts');
+    fs.mkdirSync(ttsDir, { recursive: true });
+    voiceBudgetCheck(key, vc);
+
+    const results = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const baseName = `say-${Date.now()}-${process.pid}-${i}`;
+      let outFile = '';
+      try {
+        const synth = await synthesizeSayChunk(seg, { vc, preset, voice, ttsDir, baseName });
+        outFile = synth.file;
+        voiceBudgetCheck(key, vc);
+        const sent = await sendVoiceV2(key, outFile, { guard: true, audit: true });
+        voiceBudgetCommit(key);
+        const segLabel = label
+          ? (segments.length > 1 ? `${label}(${i + 1}/${segments.length})` : label)
+          : `[语音]${seg.slice(0, 40)}`;
+        recordVoiceSentV2(key, sent, segLabel);
+        log(`[voice] ${key} 说了句话[${i + 1}/${segments.length}]（${seg.length} 字, ${synth.voice}, ${sent.detail}, messageId=${sent.messageId ?? '?'}）`);
+        results.push({ sent, voice: synth.voice, engine: synth.engine, textLang: synth.textLang });
+      } finally {
+        if (outFile) {
+          try { fs.rmSync(outFile, { force: true }); } catch { /* 忽略清理失败 */ }
         }
       }
-
-      if (!ttsSuccess) {
-        const py = path.join(ROOT, 'tts', 'venv', 'Scripts', 'python.exe');
-        if (!fs.existsSync(py)) throw new Error('TTS 生成失败：GPT-SoVITS 离线且缺少 edge-tts');
-        const edgeOutFile = outFile.replace(/\.wav$/, '.mp3');
-        await new Promise((resolve, reject) => {
-          const child = execFileFn(py, ['-m', 'edge_tts', '--voice', voiceName, '--rate=' + preset.rate, '--pitch=' + preset.pitch, '--volume=' + (preset.volume || '+0%'), '--text', clean, '--write-media', edgeOutFile], {
-            windowsHide: true
-          });
-          let errText = '';
-          child.stderr.on('data', (d) => { errText += String(d); if (errText.length > 2000) errText = errText.slice(-2000); });
-          const timer = setTimeout(() => { child.kill(); reject(new Error('TTS 超时（30s）')); }, 30000);
-          child.on('error', (error) => { clearTimeout(timer); reject(new Error(`TTS 启动失败：${error?.message ?? error}`)); });
-          child.on('close', (code) => {
-            clearTimeout(timer);
-            if (code === 0 && fs.existsSync(edgeOutFile) && fs.statSync(edgeOutFile).size > 0) {
-              fs.renameSync(edgeOutFile, outFile);
-              resolve();
-            } else {
-              reject(new Error(`TTS 失败（exit=${code}）：${errText.trim().slice(0, 160) || '无输出'}`));
-            }
-          });
-        });
-      }
-
-      voiceBudgetCheck(key, vc);
-      const sent = await sendVoiceV2(key, outFile, { guard: true, audit: true });
-      voiceBudgetCommit(key);
-      const shown = label || `[语音]${clean.slice(0, 40)}`;
-      recordVoiceSentV2(key, sent, shown);
-      log(`[voice] ${key} 说了句话（${clean.length} 字, ${sent.detail}, messageId=${sent.messageId ?? '?'}）`);
-      return { messageId: sent.messageId ?? null, text: clean, mood: chosenMood, rate: preset.rate, duration: sent.duration ?? null, detail: sent.detail, voice: voiceName };
-    } finally {
-      try { fs.rmSync(outFile, { force: true }); } catch { /* 忽略清理失败 */ }
     }
+
+    const first = results[0];
+    const messageIds = results.map((r) => r.sent.messageId ?? null).filter(Boolean);
+    const totalDuration = results.reduce((sum, r) => sum + (Number(r.sent.duration) || 0), 0);
+    return {
+      messageId: first?.sent?.messageId ?? null,
+      messageIds,
+      segmentCount: results.length,
+      text: clean,
+      mood: chosenMood,
+      rate: preset.rate,
+      duration: totalDuration || first?.sent?.duration || null,
+      detail: results.map((r) => r.sent.detail).join(' + '),
+      voice: first?.voice || resolveEdgeTtsVoice(clean, voice, vc.ttsVoice)
+    };
   }
 
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。

@@ -263,7 +263,9 @@
       "sovitsEnabled": true,
       "sovitsUrl": "http://127.0.0.1:9880",
       "sovitsSpeed": 1,
-      "sovitsTimeoutMs": 120000
+      "sovitsTimeoutMs": 240000,
+      "maxSayChars": 500,
+      "maxBarChars": 220
     },
     "proactive": {
       "enabled": true,
