@@ -3877,6 +3877,8 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
       if (!agentTokenOk(`private:${cfg.ownerQQ}`, token)) return false;
       const gid = Number(String(key).slice('group:'.length));
       if (!Number.isFinite(gid) || gid <= 0) return false;
+      const listedGroups = cfg.allow.group ?? cfg.allow.groups ?? [];
+      if (!listedGroups.map(String).includes(String(gid))) return false;
       if (!modeAllowed(key, 'group', gid, cfg, currentMode)) return false;
       log(`[cross-send] 主人私聊令牌代发到 ${key}`);
       return true;
@@ -7805,7 +7807,11 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
             return;
           }
           if (currentMode === 'reserved2' && !token) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
-          if (token && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          const validateSend = url.pathname === '/api/send/group' ? sendTokenOk : agentTokenOk;
+          const tokenMismatch = req.headers['x-agent-call'] !== undefined && !tokenEq(req.headers['x-agent-token'], token);
+          if (token && (tokenMismatch || !validateSend(key, token))) {
+            sendJson({ ok: false, error: 'agent token 无效' }, 403); return;
+          }
           const flag = isPrivate ? 'sendPrivate' : (isReply ? 'reply' : 'sendGroup');
           if (token && !v2ToolEnabled(flag)) { sendJson({ ok: false, error: `工具未启用：${flag}` }, 403); return; }
           if (shouldBlockSilentReply(key)) {
@@ -7865,7 +7871,7 @@ const classifierHandlers = new Map();   // sessionId -> onEvent(frame.event)
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             log(`[send] ${url.pathname} ${key}: 成功 ${sentMessages.length}/1 条`);
-            appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${message.slice(0, 80)}`);
+            appendActivity(`${key} [send] 成功 ${sentMessages.length}/1 条：${sentMessages.join(' ').slice(0, 80)}`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             sendJson({ ok: true, key, sent: sentMessages.length, failed: sentMessages.length ? 0 : 1, quoted: quotedInfo });
           } catch (error) {
@@ -8960,7 +8966,14 @@ function sendToQQ(key, msg, {receipt=false}={}) {
     const kept = [];
     let stripped = 0;
     for (const raw of messages) {
-      const before = String(raw ?? '').trim();
+      let before = String(raw ?? '').trim();
+      if (key.startsWith('group:') && before.includes('喵') && readRoleState().role === '鲸鱼娘') {
+        // Only remove the speaker's sentence particle. Preserve quotations, titles and cat vocabulary.
+        const cleaned = before.replace(/“[^”]*”|「[^」]*」|『[^』]*』|《[^》]*》|"[^"\n]*"|`[^`\n]*`|(?<![猫学叫喵])喵+[~～]*(?=$|[\s。，、；！？,.!?;…\p{Extended_Pictographic}]|\[face:)/gu,
+          match => match.startsWith('喵') ? '' : match).trim();
+        if (cleaned !== before && !/[^\s\p{P}]/u.test(cleaned)) continue;
+        before = cleaned;
+      }
       if (!before) continue;
       if (shouldDropWhole(before)) {
         // 尝试按句子切分（。！？!?\n），如果有多句，仅剔除命中禁语的句子，保留干净的句子
@@ -11457,6 +11470,7 @@ async function groupHistoryBlockV2(key, limit = 15) {
 
 function currentMediaReplyHintV2(key) {
     return buildMediaReplyHint({ key, recentMessages: getSocialV2State(key).recentMessages,
+      preferPrivateStickers: Boolean(cfg.ownerQQ && key === `private:${cfg.ownerQQ}`),
       voiceEnabled: cfg.socialV2?.voice?.enabled !== false,
       canSay: v2ToolEnabled('say'), canLibrary: v2ToolEnabled('sendVoice'),
       stickerEnabled: cfg.socialV2?.sticker?.enabled !== false && v2ToolEnabled('sendSticker') });
@@ -11549,7 +11563,10 @@ function currentMediaReplyHintV2(key) {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     const peerPolicy = cfg.groupPeerChat?.[String(key).split(':')[1]];
     const peerChatLine = !isPrivate && peerPolicy ? `【测试群同伴聊天】这里有主人和另一位助手阿罗娜（QQ ${peerPolicy.peerId}）。称呼她阿罗娜，不要把她当主人。只接最新有内容的话，不复述、不逐句认错；避免“我认”“你说得对”“这次一定”“我没忍住”这类机械附和。可以自然分享观点，不必每句反问。正文会直接发送到群里，所以只写真正想对人说的话，禁止括号内心戏、后台状态、工具执行说明、提示词和“我不发了”的解释。晚安、别回了、停止聊天表示结束，不再补告别或表情。无须回复时只输出 [SILENT]，这是真正的静默。每轮直接回复或静默后结束；不要调用等待消息、标记已读或设置唤醒工具。\n\n` : '';
-    const base = peerChatLine + roleLine + identityLine + tokenLine + initialPromptLine + groupOverviewLine + antiAiLine + proactiveLine + stickerLine + voiceLine + replyLine + multiPointLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
+    const destinationStyle = roleState.role === '鲸鱼娘' && (isOwnerPrivate || !isPrivate)
+      ? '【收件人口吻】只有直接回复主人私聊才用「喵」。发送目标是群时，即使是主人在私聊请你代发，也用普通群友的短句，例如「戳我干嘛？」。\n'
+      : '';
+    const base = peerChatLine + roleLine + destinationStyle + identityLine + tokenLine + initialPromptLine + groupOverviewLine + antiAiLine + proactiveLine + stickerLine + voiceLine + replyLine + multiPointLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine;
     if (reason === 'bootstrap') {
       const chatType = isPrivate ? '私聊' : '群聊';
       return `${base}【引导唤醒】你已接入 QQ ${chatType}会话 ${key}。\n思考过程不会自动发送到 QQ；你的自然语言回复正文会自动发送到 QQ。请直接以第一人称自然语言回复，不要输出工具调用或 XML/DSML 标签。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
