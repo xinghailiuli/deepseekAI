@@ -188,6 +188,8 @@ const SAFE_EXACT = new Set([
   'mc_status',
   'mc_last_actions',
   'mcp__numen__list_companions',
+  'liuli_books',
+  'liuli_cottage_status',
 ]);
 
 // 「分流已启用」标志：该文件存在时，旧 Minecraft MCP（假玩家）工具一律拒绝执行。
