@@ -1313,7 +1313,7 @@ function consolePortInUse() {
     const cfg = readJsonSafe(path.join(ROOT, 'config.json'), {});
     const port = Number(cfg?.consolePort) || 3100;
     if (process.platform === 'win32') {
-      const out = execFileSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+      const out = execFileSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
       return new RegExp(`[:.]${port}\\s+\\S+\\s+LISTENING`, 'i').test(out);
     }
     const out = execFileSync('sh', ['-c', 'ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null || true'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
