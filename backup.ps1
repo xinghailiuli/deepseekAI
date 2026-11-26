@@ -116,19 +116,24 @@ console.log("配置脱敏快照已更新");
   Remove-Item $tmp3 -Force -ErrorAction SilentlyContinue
 
   # 6) 提交
+  $env:GIT_TERMINAL_PROMPT = '0'
   Set-Location $root
   $status = git status --porcelain
+  if ($LASTEXITCODE -ne 0) { throw "git status 失败 (exit=$LASTEXITCODE)" }
   if (-not ($status | Where-Object { $_ })) {
     W "没有变更，跳过提交"
   } else {
     git add -A 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "git add 失败 (exit=$LASTEXITCODE)" }
     $msg = "备份 $today（人物卡/日记/代码快照/deploy）"
-    git -c user.name="xinghailiuli" -c user.email="xinghailiuli@users.noreply.github.com" commit -q -m $msg 2>&1 | Out-Null
+    $commitOut = git -c user.name="xinghailiuli" -c user.email="xinghailiuli@users.noreply.github.com" commit -q -m $msg 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw ("git commit 失败 (exit=" + $LASTEXITCODE + "): " + (($commitOut | Select-Object -Last 2) -join ' | '))
+    }
     W "已提交：$msg"
   }
 
   # 7) 推送
-  $env:GIT_TERMINAL_PROMPT = '0'
   git remote set-url origin https://github.com/xinghailiuli/deepseekAI.git 2>&1 | Out-Null
   $push = git push origin HEAD:main 2>&1
   $tail = ($push | Select-Object -Last 2) -join ' | '
@@ -138,11 +143,26 @@ console.log("配置脱敏快照已更新");
     W "推送失败：$tail"
     $tok = ''
     try { $tok = (Get-Content 'D:\deepseenhanress\qq-bot\features\GitHub\config.json' -Raw -Encoding UTF8 | ConvertFrom-Json).token } catch {}
-    if ($tok) {
-      W "尝试用 config 里的 token 兜底推送"
-      $p2 = git -c credential.helper= push "https://x-access-token:$tok@github.com/xinghailiuli/deepseekAI.git" HEAD:main 2>&1
-      W ("兜底结果：" + (($p2 | Select-Object -Last 1) -join ''))
+    if (-not $tok) { throw "推送失败且未配置兜底 token" }
+    W "尝试用 GIT_ASKPASS 凭据助手兜底推送"
+    $askPass = Join-Path $env:TEMP ("gh-askpass-" + [guid]::NewGuid().ToString('N') + ".cmd")
+    $askCode = "@echo off`r`necho(%~1|findstr /I ""Username"" >nul && (echo x-access-token) || (echo %GH_BACKUP_TOKEN%)"
+    [IO.File]::WriteAllText($askPass, $askCode, [Text.Encoding]::ASCII)
+    $prevAsk = $env:GIT_ASKPASS
+    $prevTok = $env:GH_BACKUP_TOKEN
+    try {
+      $env:GIT_ASKPASS = $askPass
+      $env:GH_BACKUP_TOKEN = $tok
+      $p2 = git -c credential.helper= push "https://github.com/xinghailiuli/deepseekAI.git" HEAD:main 2>&1
+      $p2Exit = $LASTEXITCODE
+    } finally {
+      $env:GIT_ASKPASS = $prevAsk
+      $env:GH_BACKUP_TOKEN = $prevTok
+      Remove-Item -LiteralPath $askPass -Force -ErrorAction SilentlyContinue
     }
+    $p2Tail = ($p2 | Select-Object -Last 1) -join ''
+    W ("兜底结果：" + $p2Tail)
+    if ($p2Exit -ne 0) { throw "兜底推送失败 (exit=$p2Exit): $p2Tail" }
   }
 } catch {
   W ("备份异常：" + $_.Exception.Message)

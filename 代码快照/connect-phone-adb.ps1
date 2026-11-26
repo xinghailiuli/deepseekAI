@@ -1,4 +1,4 @@
-# 确保 adb 里有手机：优先 USB，其次上次成功的无线地址
+﻿# 确保 adb 里有手机：优先 USB，其次上次成功的无线地址
 # 由 whale-watchdog.ps1 调用；也支持手动跑：powershell -File connect-phone-adb.ps1
 $ErrorActionPreference = 'Continue'
 $root = 'D:\deepseenhanress\qq-bot'
@@ -31,8 +31,50 @@ if (-not $adb) {
 }
 if (-not $adb) { Log 'adb 未找到，跳过'; exit 1 }
 
+# helper: bounded adb execution without inheriting stdout pipes to child fork-server
+function Invoke-AdbBounded([string[]]$AdbArgs, [int]$TimeoutMs = 8000) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $adb
+  $psi.Arguments = ($AdbArgs | ForEach-Object { if ($_ -match '\s') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ } }) -join ' '
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $proc = New-Object System.Diagnostics.Process
+  $proc.StartInfo = $psi
+  try {
+    $null = $proc.Start()
+    $outTask = $proc.StandardOutput.ReadToEndAsync()
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    if (-not $proc.WaitForExit($TimeoutMs)) {
+      try { $proc.Kill() } catch {}
+      return @()
+    }
+    $text = ''
+    if ($outTask.Wait(1000)) { $text += $outTask.Result }
+    if ($errTask.Wait(1000)) { $text += "`n" + $errTask.Result }
+    return @($text -split "\r?\n" | Where-Object { $_ -ne '' })
+  } finally {
+    $proc.Dispose()
+  }
+}
+
+# Pre-start detached adb daemon cleanly if not listening on 5037 so short queries do not hold caller pipes
+try {
+  $adbUp = Test-NetConnection 127.0.0.1 -Port 5037 -InformationLevel Quiet -WarningAction SilentlyContinue
+  if (-not $adbUp) {
+    $kaStartup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ ShowWindow = [uint16]0 }
+    $null = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+      CommandLine = ('"' + $adb + '" start-server')
+      CurrentDirectory = $root
+      ProcessStartupInformation = $kaStartup
+    }
+    Start-Sleep -Seconds 1
+  }
+} catch {}
+
 # 2) 现有设备
-$lines = & $adb devices 2>&1 | Where-Object { $_ -match '\t(device|unauthorized|offline)$' -or $_ -match ':(5555|5037)\s+device' }
+$lines = (Invoke-AdbBounded @('devices') 8000) | Where-Object { $_ -match '\t(device|unauthorized|offline)$' -or $_ -match ':(5555|5037)\s+device' }
 $devices = @()
 foreach ($l in $lines) {
   $parts = ($l -split '\s+') | Where-Object { $_ }
@@ -59,8 +101,8 @@ if (Test-Path $stateFile) {
 $candidates += @('192.168.182.14:5555', '192.168.18.68:5555')
 
 foreach ($addr in ($candidates | Select-Object -Unique)) {
-  $out = & $adb connect $addr 2>&1
-  if ($out -match 'connected to') {
+  $out = Invoke-AdbBounded @('connect', $addr) 8000
+  if (($out -join "`n") -match 'connected to') {
     Log ('无线连接成功: ' + $addr)
     @{ at = (Get-Date).ToString('o'); lastWifi = $addr; wireless = @($addr) } | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8
     exit 0

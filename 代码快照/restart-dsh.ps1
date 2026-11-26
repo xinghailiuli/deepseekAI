@@ -71,13 +71,18 @@ Remove-Item env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
 
 if (-not (Test-Path $exe)) { Log ("找不到可执行文件: $exe"); Save-Status @{ phase = 'failed'; reason = 'exe-missing' }; exit 1 }
 try {
-  if (Test-Path $dshLauncher) {
-    Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$dshLauncher`"" -WindowStyle Hidden
-    Log '已通过受管入口 start-dsh.cmd 启动 DSH'
-  } else {
-    Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
-    Log '已启动 DSH 原生主程序'
-  }
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $exe
+  $psi.WorkingDirectory = Split-Path $exe
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $psi.EnvironmentVariables['DSH_HOME'] = 'D:\deepseenhanress\_dsh\home'
+  $psi.EnvironmentVariables['TEMP'] = 'D:\deepseenhanress\_dsh\tmp'
+  $psi.EnvironmentVariables['TMP'] = 'D:\deepseenhanress\_dsh\tmp'
+  $psi.EnvironmentVariables.Remove('ELECTRON_RUN_AS_NODE')
+  New-Item -ItemType Directory -Force -Path 'D:\deepseenhanress\_dsh\home', 'D:\deepseenhanress\_dsh\tmp' | Out-Null
+  $dp = [System.Diagnostics.Process]::Start($psi)
+  Log ("已无 cmd 弹窗直接启动受管 DSH（PID=$($dp.Id)）")
 }
 catch { Log ("启动失败: " + $_.Exception.Message); Save-Status @{ phase = 'failed'; reason = 'spawn'; error = $_.Exception.Message }; exit 1 }
 
@@ -95,18 +100,33 @@ try {
 Log ("DSH 19387 就绪 = $up；监听 PID = $owner")
 Save-Status @{ phase = 'up'; ready = $up; listenPid = $owner; at = (Get-Date).ToString('s') }
 
+function Invoke-BoundedPsScript([string]$ScriptPath, [int]$TimeoutMs = 30000) {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+  $psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`""
+  $psi.UseShellExecute = $false
+  $psi.CreateNoWindow = $true
+  $p = [System.Diagnostics.Process]::Start($psi)
+  try {
+    if ($p -and -not $p.WaitForExit($TimeoutMs)) { try { $p.Kill() } catch {} ; return $false }
+    return $true
+  } finally { if ($p) { $p.Dispose() } }
+}
+
 # 5) 手机 adb（USB 优先，否则上次成功的无线地址）
 $phone = 'D:\deepseenhanress\qq-bot\scripts\connect-phone-adb.ps1'
 if (Test-Path $phone) {
-  try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $phone 2>&1 | Out-Null; Log '已执行手机 adb 连接' }
-  catch { Log ("手机连接脚本异常: " + $_.Exception.Message) }
+  try {
+    if (Invoke-BoundedPsScript $phone 25000) { Log '已执行手机 adb 连接' } else { Log '手机 adb 连接超时已跳过' }
+  } catch { Log ("手机连接脚本异常: " + $_.Exception.Message) }
 }
 
 # 6) 看门狗（桥接 / Magpie / 游戏服务）
 $wd = 'D:\deepseenhanress\qq-bot\scripts\whale-watchdog.ps1'
 if (Test-Path $wd) {
-  try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $wd 2>&1 | Out-Null; Log '已执行看门狗' }
-  catch { Log ("看门狗异常: " + $_.Exception.Message) }
+  try {
+    if (Invoke-BoundedPsScript $wd 90000) { Log '已执行看门狗' } else { Log '看门狗执行超时已跳过' }
+  } catch { Log ("看门狗异常: " + $_.Exception.Message) }
 }
 
 # 7) MCP 自查：同一 MCP 出现两份就是预设里重复挂了
